@@ -187,7 +187,7 @@ class Dinic:
     def __init__(self, N):
         self.N = N
         self.adj = [[] for _ in range(N)]
-               self.level = [0]*self.N
+        self.level = [0]*self.N
         self.it = [0]*self.N
 
     def add_edge(self, u, v, cap):
@@ -522,3 +522,4 @@ if run_btn:
 else:
     st.info("Upload the two Excel files for a single month and click **Generate Schedule**. "
             "The app detects the month automatically from headers like 'Are you available 7 September?'.")
+
