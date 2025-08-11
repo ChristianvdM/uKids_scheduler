@@ -7,36 +7,25 @@ import numpy as np
 import streamlit as st
 from datetime import datetime, date
 from typing import Dict, List, Tuple
-from collections import defaultdict
-from datetime import datetime
-from io import BytesIO
 import base64
 import re
 
 st.set_page_config(page_title='uKids Scheduler', layout='wide')
 st.title('uKids Scheduler')
 
-# Set black theme using custom CSS
+# ---- Black theme via CSS ----
 st.markdown(
     """
     <style>
-        body {
-            background-color: #000000;
-            color: white;
-        }
-        .stApp {
-            background-color: #000000;
-        }
-        .stButton>button, .stDownloadButton>button {
-            background-color: #444;
-            color: white;
-        }
+        body { background-color: #000000; color: white; }
+        .stApp { background-color: #000000; }
+        .stButton>button, .stDownloadButton>button { background-color: #444; color: white; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# Load and center the logo
+# ---- Centered logo (optional) ----
 try:
     with open("image(1).png", "rb") as img_file:
         encoded = base64.b64encode(img_file.read()).decode()
@@ -46,7 +35,7 @@ try:
             </div>
         """, unsafe_allow_html=True)
 except FileNotFoundError:
-    st.warning("Logo image not found. Please upload or place 'image.png' in the app directory.")
+    pass  # logo optional
 
 # ------------------------------
 # Config
@@ -74,6 +63,7 @@ MONTH_ALIASES = {
 
 YES_SET = {"yes", "y", "true", "available"}
 
+# Default capacities (hidden; not shown in UI)
 DEFAULT_CAPACITIES = [
     {"Role": "Age 1 volunteers", "Capacity": 5},
     {"Role": "Age 1 nappies", "Capacity": 1},
@@ -94,6 +84,8 @@ DEFAULT_CAPACITIES = [
     {"Role": "Age 10 volunteers", "Capacity": 1},
     {"Role": "Age 11 volunteers", "Capacity": 1},
     {"Role": "Special needs volunteers", "Capacity": 2},
+    # If you want explicit "Age X leader" rows, add lines like:
+    # {"Role": "Age 1 leader", "Capacity": 1},
 ]
 
 def normalize(s: str) -> str:
@@ -193,7 +185,7 @@ def schedule_with_capacities(long_df: pd.DataFrame,
                              availability: Dict[str, Dict[pd.Timestamp, bool]],
                              service_dates: List[pd.Timestamp],
                              capacity_df: pd.DataFrame,
-                             role_map: Dict[str, List[str]]) -> Tuple[pd.DataFrame, Dict[str, int], pd.DataFrame, float]:
+                             role_map: Dict[str, List[str]]) -> Tuple[Dict[tuple, list], Dict[str, int], pd.DataFrame, float]:
     rng = np.random.default_rng(RANDOM_SEED)
     target = 2
     people = long_df["person"].unique()
@@ -260,7 +252,6 @@ def schedule_with_capacities(long_df: pd.DataFrame,
 
     # -------- PASS 2 (optional): Allow a 3rd assignment if most people reached 2 --------
     if unfilled and ratio_with_two >= MOST_PEOPLE_RATIO:
-        # Try to fill remaining using people at exactly 2 (cap at 3), still no double-booking per date
         remaining_map = {}
         for (role, d), names in schedule_cells.items():
             cap = int(capacity_df.loc[capacity_df["Role"] == role, "Capacity"].iloc[0])
@@ -295,7 +286,7 @@ def schedule_with_capacities(long_df: pd.DataFrame,
                     candidates.append((p, best_pr))
 
                 while rem > 0 and candidates:
-                    candidates.sort(key=lambda x: (x[1], rng.random()))
+                    candidates.sort(key=lambda x: (x[1], np.random.random()))
                     chosen, pr = candidates[0]
                     schedule_cells[(cap_role, d)].append(chosen)
                     assign_count[chosen] += 1  # now 3
@@ -312,15 +303,41 @@ def schedule_with_capacities(long_df: pd.DataFrame,
             if rem > 0:
                 unfilled.append({"Role": role, "Date": d.strftime("%Y-%m-%d"), "MissingCount": rem})
 
-    # Build display
-    disp = pd.DataFrame(index=role_names, columns=service_dates)
-    for (role, d), names in schedule_cells.items():
-        disp.loc[role, d] = ", ".join(names)
-    disp = disp.fillna("")
-    disp.columns = [d.strftime("%Y-%m-%d") for d in disp.columns]
     unfilled_df = pd.DataFrame(unfilled)
+    return schedule_cells, assign_count, unfilled_df, ratio_with_two
 
-    return disp, assign_count, unfilled_df, ratio_with_two
+def expand_to_slot_rows(capacity_df: pd.DataFrame, service_dates: List[pd.Timestamp], schedule_cells: Dict[tuple, list]) -> pd.DataFrame:
+    """
+    Build a display table with one row per *slot*:
+      - If role name ends with 'volunteers', label rows as the base (e.g., 'Age 1')
+      - Otherwise, keep the role name as-is (e.g., 'Age 1 nappies')
+    Duplicate row labels are allowed (e.g., 'Age 1' appears 5 times).
+    """
+    rows = []
+    index_labels = []
+    date_cols = [d.strftime('%Y-%m-%d') for d in service_dates]
+
+    for _, crow in capacity_df.iterrows():
+        cap_role = str(crow['Role']).strip()
+        cap = int(crow['Capacity'])
+        is_volunteers = cap_role.lower().endswith('volunteers')
+        base_label = cap_role[:-10].strip() if is_volunteers else cap_role  # remove 'volunteers'
+
+        # Gather per-date lists once for this cap_role
+        per_date_names = {d: schedule_cells.get((cap_role, d), []) for d in service_dates}
+
+        # For each slot index, make a row
+        for slot_idx in range(cap):
+            row = {}
+            for d in service_dates:
+                names = per_date_names[d]
+                row[d.strftime('%Y-%m-%d')] = names[slot_idx] if slot_idx < len(names) else ''
+            rows.append(row)
+            index_labels.append(base_label)
+
+    disp = pd.DataFrame(rows, columns=date_cols)
+    disp.index = index_labels  # duplicate labels OK
+    return disp
 
 # ------------------------------
 # UI (everything on page)
@@ -332,9 +349,6 @@ with col1:
 with col2:
     responses_file = st.file_uploader("Form responses (Excel)", type=["xlsx", "xls"], key="responses_file")
 
-st.subheader("2) Capacities per date")
-cap_df = st.data_editor(pd.DataFrame(DEFAULT_CAPACITIES), num_rows="dynamic", key="cap_table")
-
 run_btn = st.button("Generate Schedule", type="primary")
 
 if run_btn:
@@ -345,9 +359,12 @@ if run_btn:
     people_df = pd.read_excel(people_file)
     responses_df = pd.read_excel(responses_file)
 
+    # Hidden capacities (no editor shown)
+    cap_df = pd.DataFrame(DEFAULT_CAPACITIES)
+
+    # Detect name columns and roles
     name_col_people = detect_name_column(people_df)
     name_col_resp = detect_name_column(responses_df)
-
     role_cols = [c for c in people_df.columns if c != name_col_people and is_priority_col(people_df[c])]
     if not role_cols:
         st.error("No role columns with priorities (0-5) detected in the serving positions file.")
@@ -368,20 +385,23 @@ if run_btn:
 
     role_map = map_capacity_roles_to_sheet(cap_df, role_cols)
 
-    schedule_display, assign_count, unfilled_df, ratio_with_two = schedule_with_capacities(
+    schedule_cells, assign_count, unfilled_df, ratio_with_two = schedule_with_capacities(
         long_df, availability, service_dates, cap_df, role_map
     )
 
+    # ---- Display: per-slot rows (dates as columns) ----
     st.success(f"Schedule generated for {date(service_dates[0].year, service_dates[0].month, 1):%B %Y}!")
 
-    st.subheader("3) Schedule (positions as rows, dates as columns)")
-    st.dataframe(schedule_display, use_container_width=True)
+    st.subheader("2) Schedule (each slot as its own row; dates as columns)")
+    slot_disp = expand_to_slot_rows(cap_df, service_dates, schedule_cells)
+    st.dataframe(slot_disp, use_container_width=True)
 
-    st.subheader("Role Mapping (capacities → sheet columns)")
-    mapping_rows = []
-    for cap_role, mapped in role_map.items():
-        mapping_rows.append({"Capacity Role": cap_role, "Matched Sheet Roles": ", ".join(mapped) if mapped else "(no match)"})
-    st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
+    # Mapping diagnostics (hidden by default – enable if needed)
+    # st.subheader("Role Mapping (capacities → sheet columns)")
+    # mapping_rows = []
+    # for cap_role, mapped in role_map.items():
+    #     mapping_rows.append({"Capacity Role": cap_role, "Matched Sheet Roles": ", ".join(mapped) if mapped else "(no match)"})
+    # st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
 
     st.subheader("Assignment Summary")
     series = pd.Series(assign_count, name="AssignedCount").sort_values(ascending=False)
@@ -392,35 +412,24 @@ if run_btn:
             f"{'A 3rd-pass fill was applied.' if ratio_with_two >= MOST_PEOPLE_RATIO else 'No 3rd-pass fill applied (threshold 80%).'}")
 
     if not unfilled_df.empty:
-        st.warning("Some slots could not be filled even after the 3rd-pass rule:")
+        st.warning("Some slots could not be filled under the rules:")
         st.dataframe(unfilled_df, use_container_width=True)
 
-    # Downloads
+    # Downloads (export per-slot rows)
     out_xlsx = io.BytesIO()
     with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-        schedule_display.to_excel(writer, sheet_name="Schedule", index=True)
-        pd.DataFrame(mapping_rows).to_excel(writer, sheet_name="RoleMapping", index=False)
+        slot_disp.to_excel(writer, sheet_name="Schedule", index=True)
         report_df.to_excel(writer, sheet_name="AssignmentSummary", index=False)
         cap_df.to_excel(writer, sheet_name="Capacities", index=False)
     out_xlsx.seek(0)
 
     out_csv = io.StringIO()
-    schedule_display.to_csv(out_csv)
+    slot_disp.to_csv(out_csv)
     out_csv.seek(0)
 
     st.download_button("Download Excel (.xlsx)", data=out_xlsx, file_name=f"uKids_schedule_{year}_{month:02d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.download_button("Download CSV (.csv)", data=out_csv.getvalue(), file_name=f"uKids_schedule_{year}_{month:02d}.csv", mime="text/csv")
 
 else:
-    st.info("Upload the two Excel files for a single month, check capacities, then click **Generate Schedule**. ")
-
-
-
-
-
-
-
-
-
-
-
+    st.info("Upload the two Excel files for a single month and click **Generate Schedule**. "
+            "The app detects the month automatically from headers like 'Are you available 7 September?'.")
