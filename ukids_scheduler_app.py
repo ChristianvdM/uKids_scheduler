@@ -47,8 +47,10 @@ except FileNotFoundError:
 # Config
 # ------------------------------
 MOST_PEOPLE_RATIO = 0.80      # if >=80% reached 2, allow a 3rd assignment
-BEST_OF_N = 25                # randomized tie-break restarts; higher = better chance to minimize unfilled
+BEST_OF_N = 25# randomized tie-break restarts; higher = better chance to minimize unfilled
 RNG_SEED_BASE = 20250811      # base seed so results are stable per run, but varied across tries
+
+SEARCH_RUNS = 25
 
 # ------------------------------
 # Helpers
@@ -676,8 +678,6 @@ with col2:
     responses_file = st.file_uploader("Form responses (Excel)", type=["xlsx", "xls"], key="responses_file")
 
 # Optional: allow changing Best-of-N for deeper search
-BEST_OF_N = st.slider("Search depth (Best-of-N)", 5, 100, BEST_OF_N, 5, help="Higher tries more tie-break variants to reduce unfilled roles.")
-
 run_btn = st.button("Generate Schedule", type="primary")
 
 if run_btn:
