@@ -1,4 +1,3 @@
-
 # Streamlit app for uKids Children Scheduler (Max-Fill, Deterministic) + LowAvailability export + Inline Flags
 # Save as ukids_scheduler_app.py and run with: streamlit run ukids_scheduler_app.py
 
@@ -17,24 +16,25 @@ st.title('uKids Scheduler')
 
 # ---- Black theme via CSS ----
 st.markdown(
-    \"\"\"
+    """
     <style>
         body { background-color: #000000; color: white; }
         .stApp { background-color: #000000; }
         .stButton>button, .stDownloadButton>button { background-color: #444; color: white; }
     </style>
-    \"\"\", unsafe_allow_html=True
+    """,
+    unsafe_allow_html=True
 )
 
 # ---- Centered logo (optional) ----
 try:
     with open("image(1).png", "rb") as img_file:
         encoded = base64.b64encode(img_file.read()).decode()
-        st.markdown(f\"\"\"
+        st.markdown(f"""
             <div style='text-align: center;'>
                 <img src='data:image/png;base64,{encoded}' width='600'>
             </div>
-        \"\"\", unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 except FileNotFoundError:
     pass  # logo optional
 
@@ -132,7 +132,7 @@ def parse_month_and_dates_from_headers(responses_df: pd.DataFrame) -> Tuple[int,
             if alias in c_low:
                 month_name = alias
                 break
-        day_match = re.search(r"(\\d{1,2})", c_low)
+        day_match = re.search(r"(\d{1,2})", c_low)
         day = int(day_match.group(1)) if day_match else None
         if month_name and day:
             col_info.append((c, MONTH_ALIASES[month_name], day))
@@ -187,8 +187,8 @@ class Dinic:
     def __init__(self, N):
         self.N = N
         self.adj = [[] for _ in range(N)]
-        self.level = [0]*N
-        self.it = [0]*N
+               self.level = [0]*self.N
+        self.it = [0]*self.N
 
     def add_edge(self, u, v, cap):
         self.adj[u].append([v, cap, len(self.adj[v])])
@@ -406,7 +406,7 @@ def expand_to_slot_rows(capacity_df: pd.DataFrame, service_dates: List[pd.Timest
     return disp
 
 def build_availability_counts_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
-    \"\"\"Availability counts for ALL eligible people (from serving positions with priority >=1 on at least one role).\"\"\"
+    """Availability counts for ALL eligible people (from serving positions with priority >=1 on at least one role)."""
     people_pool = sorted(long_df['person'].unique())
     records = []
     for p in people_pool:
@@ -489,7 +489,6 @@ if run_btn:
     summary_df["MissingToTwo"] = summary_df["MissingToTwo"].fillna(2).astype(int)
     summary_df["YesDates"] = summary_df["YesDates"].fillna("")
     summary_df["Flag"] = np.where(summary_df["YesCount"] < 2, "⚠️ Low availability", "")
-    # Show flagged first, then higher MissingToTwo, then sort by name
     summary_df = summary_df.sort_values(by=["Flag", "MissingToTwo", "Person"], ascending=[False, False, True])
     st.dataframe(summary_df, use_container_width=True)
 
