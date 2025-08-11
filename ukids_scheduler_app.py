@@ -226,3 +226,4 @@ if run_btn:
     st.write(f'People with > 2 assignments: {len(over)} (should be 0)')
 else:
     st.info('Upload the two Excel files on the left, set month/year and rule, then click **Generate Schedule**.')
+
