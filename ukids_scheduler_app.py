@@ -1,6 +1,10 @@
 
-# Streamlit app for uKids Children Scheduler (Max-Fill, Deterministic)
-# Styled export to mirror "August 2025" (header colors + column widths)
+# Streamlit app for uKids Children Scheduler (Max-Fill, Best-of-N Search)
+# - Priorities are ELIGIBILITY only (0=ineligible). We do NOT prefer 1 over 5; we just try to fill.
+# - Best-of-N randomized tie-breaking to find arrangement with the FEWEST unfilled roles.
+# - Still enforces: max 2 per person (then optional 3rd pass if >=80% hit 2).
+# - Styled export matching the "August 2025" template (headers, merged sections, widths, wrapping).
+
 import io
 import pandas as pd
 import numpy as np
@@ -14,34 +18,59 @@ from collections import defaultdict
 st.set_page_config(page_title='uKids Scheduler', layout='wide')
 st.title('uKids Scheduler')
 
-# Minimal dark CSS
+# ---- Black theme via CSS ----
 st.markdown(
     """
     <style>
-        body { background-color: #000; color: white; }
-        .stApp { background-color: #000; }
-        .stButton>button, .stDownloadButton>button { background:#444; color:white; }
+        body { background-color: #000000; color: white; }
+        .stApp { background-color: #000000; }
+        .stButton>button, .stDownloadButton>button { background-color: #444; color: white; }
+        .stDataFrame { font-size: 14px; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
+# ---- Centered logo (optional) ----
+try:
+    with open("image(1).png", "rb") as img_file:
+        encoded = base64.b64encode(img_file.read()).decode()
+        st.markdown(f"""
+            <div style='text-align: center;'>
+                <img src='data:image/png;base64,{encoded}' width='600'>
+            </div>
+        """, unsafe_allow_html=True)
+except FileNotFoundError:
+    pass  # logo optional
+
 # ------------------------------
 # Config
 # ------------------------------
-MOST_PEOPLE_RATIO = 0.80   # if >=80% of people reached 2, allow a 3rd assignment
+MOST_PEOPLE_RATIO = 0.80      # if >=80% reached 2, allow a 3rd assignment
+BEST_OF_N = 25                # randomized tie-break restarts; higher = better chance to minimize unfilled
+RNG_SEED_BASE = 20250811      # base seed so results are stable per run, but varied across tries
 
 # ------------------------------
 # Helpers
 # ------------------------------
 MONTH_ALIASES = {
-    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
 }
+
 YES_SET = {"yes", "y", "true", "available"}
 
+# Capacities (leaders included). Internal only; not shown/exported.
 DEFAULT_CAPACITIES = [
     {"Role": "Oversight", "Capacity": 1},
     {"Role": "Main Director", "Capacity": 1},
@@ -120,7 +149,7 @@ def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols: List[str]) 
             if pd.isna(pr):
                 continue
             pr = int(round(pr))
-            if pr >= 1:
+            if pr >= 1:  # only roles with priority 1..5 (0 is ineligible)
                 records.append({"person": person, "role": role, "priority": pr})
     return pd.DataFrame(records)
 
@@ -163,25 +192,34 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map:
         availability.setdefault(nm, {})
         for col, dt in date_map.items():
             ans = str(row.get(col, "")).strip().lower()
-            availability[nm][dt] = ans in YES_SET
+            is_yes = ans in YES_SET
+            availability[nm][dt] = is_yes
     service_dates = sorted(set(date_map.values()))
     return availability, service_dates
 
 def map_capacity_roles_to_sheet(cap_df: pd.DataFrame, people_role_cols: List[str]) -> Dict[str, List[str]]:
-    def tokenize(s: str): return normalize(s).split()
+    def tokenize(s: str):
+        return normalize(s).split()
+
     def matches_tokens(cap_tokens, sheet_tokens):
         IGNORE = {"volunteers", "volunteer", "helpers", "helper"}
         sheet_set = set(sheet_tokens)
         for tok in cap_tokens:
-            if tok in IGNORE: continue
+            if tok in IGNORE:
+                continue
             base = tok[:-1] if tok.endswith('s') else tok
-            variants = {tok, base, base+'s'}
-            if base.endswith('ie'): variants.add(base[:-2] + 'y')
-            if base.endswith('y'): variants.add(base[:-1] + 'ies')
-            if not any(v in sheet_set for v in variants): return False
+            variants = {tok, base, base + 's'}
+            if base.endswith('ie'):
+                variants.add(base[:-2] + 'y')
+            if base.endswith('y'):
+                variants.add(base[:-1] + 'ies')
+            if not any(v in sheet_set for v in variants):
+                return False
         return True
+
     sheet_norm_map = {normalize(c): c for c in people_role_cols}
     sheet_token_map = {k: tokenize(k) for k in sheet_norm_map.keys()}
+
     mapping: Dict[str, List[str]] = {}
     for _, row in cap_df.iterrows():
         cap_role = str(row["Role"]).strip()
@@ -198,7 +236,7 @@ def map_capacity_roles_to_sheet(cap_df: pd.DataFrame, people_role_cols: List[str
     return mapping
 
 # ------------------------------
-# Max-Flow (Dinic)
+# Max-Flow (Dinic) with randomized tie-breaking
 # ------------------------------
 class Dinic:
     def __init__(self, N: int):
@@ -206,21 +244,27 @@ class Dinic:
         self.adj = [[] for _ in range(N)]
         self.level = [0] * N
         self.it = [0] * N
+
     def add_edge(self, u: int, v: int, cap: int):
         self.adj[u].append([v, cap, len(self.adj[v])])
         self.adj[v].append([u, 0, len(self.adj[u]) - 1])
+
     def bfs(self, s: int, t: int) -> bool:
         from collections import deque
         self.level = [-1] * self.N
-        q = deque([s]); self.level[s] = 0
+        q = deque([s])
+        self.level[s] = 0
         while q:
             u = q.popleft()
             for v, cap, rev in self.adj[u]:
                 if cap > 0 and self.level[v] < 0:
-                    self.level[v] = self.level[u] + 1; q.append(v)
+                    self.level[v] = self.level[u] + 1
+                    q.append(v)
         return self.level[t] >= 0
+
     def dfs(self, u: int, t: int, f: int) -> int:
-        if u == t: return f
+        if u == t:
+            return f
         for i in range(self.it[u], len(self.adj[u])):
             self.it[u] = i
             v, cap, rev = self.adj[u][i]
@@ -231,33 +275,31 @@ class Dinic:
                     self.adj[v][rev][1] += d
                     return d
         return 0
+
     def max_flow(self, s: int, t: int) -> int:
-        flow = 0; INF = 10**9
+        flow = 0
+        INF = 10 ** 9
         while self.bfs(s, t):
-            self.it = [0]*self.N
+            self.it = [0] * self.N
             f = self.dfs(s, t, INF)
             while f > 0:
                 flow += f
                 f = self.dfs(s, t, INF)
         return flow
 
-def schedule_maxfill(long_df: pd.DataFrame,
-                     availability: Dict[str, Dict[pd.Timestamp, bool]],
-                     service_dates: List[pd.Timestamp],
-                     capacity_df: pd.DataFrame,
-                     role_map: Dict[str, List[str]],
-                     per_person_cap: int,
-                     restrict_people: Set[str] | None = None):
-    people_all = sorted(long_df['person'].unique())
-    people = [p for p in people_all if (restrict_people is None or p in restrict_people)]
+def run_flow_once(long_df, availability, service_dates, capacity_df, role_map, per_person_cap, rng=None):
+    # Build people list and indices
+    people = sorted(long_df['person'].unique())
     people_idx = {p: i for i, p in enumerate(people)}
 
+    # Eligibility map (priority only used to compute optional score; not to filter except pr>=1)
     elig_by_person = {}
     for p in people:
         sub = long_df[long_df['person'] == p]
         pr_map = {row['role']: int(row['priority']) for _, row in sub.iterrows()}
         elig_by_person[p] = pr_map
 
+    # Build slots (role, date, slot_idx) and optionally shuffle for tie-breaking variety
     role_names = [str(r['Role']).strip() for _, r in capacity_df.iterrows()]
     slots = []
     for role in role_names:
@@ -265,48 +307,65 @@ def schedule_maxfill(long_df: pd.DataFrame,
         for d in service_dates:
             for sidx in range(cap):
                 slots.append((role, d, sidx))
+    if rng is not None:
+        rng.shuffle(slots)
 
+    # Candidate edges: any pr>=1 => eligible; order optionally shuffled
     pd_pairs = set()
     cand_per_slot = {}
     for role, d, sidx in slots:
-        mapped_sheet_roles = role_map.get(role, [])
+        mapped = role_map.get(role, [])
         cands = []
-        if mapped_sheet_roles:
+        if mapped:
             for p in people:
                 if not availability.get(p, {}).get(d, False):
                     continue
-                prs = [elig_by_person[p].get(rn, None) for rn in mapped_sheet_roles if rn in elig_by_person[p]]
-                prs = [pr for pr in prs if pr is not None and pr >= 1]
-                if not prs:
-                    continue
-                best_pr = min(prs)
-                cands.append((best_pr, p))
-                pd_pairs.add((p, d))
-        cands.sort(key=lambda x: (x[0], x[1]))
+                # at least one eligible mapped role with pr>=1
+                ok = any((elig_by_person[p].get(rn, 0) >= 1) for rn in mapped if rn in elig_by_person[p])
+                if ok:
+                    # record min priority just for scoring later; not used to decide edges
+                    best_pr = min((elig_by_person[p].get(rn, 99) for rn in mapped))
+                    cands.append((best_pr, p))
+                    pd_pairs.add((p, d))
+        # shuffle to alter Dinic's tie-breaks
+        if rng is not None:
+            rng.shuffle(cands)
         cand_per_slot[(role, d, sidx)] = [p for _, p in cands]
 
+    # Build graph
     SLOTS = len(slots)
     pd_list = sorted(pd_pairs, key=lambda x: (x[1], x[0]))
     pd_index = {pd: i for i, pd in enumerate(pd_list)}
 
-    src = 0; slot_base = 1; pd_base = slot_base + SLOTS
-    person_base = pd_base + len(pd_index); sink = person_base + len(people)
-    N = sink + 1; din = Dinic(N)
+    src = 0
+    slot_base = 1
+    pd_base = slot_base + SLOTS
+    person_base = pd_base + len(pd_index)
+    sink = person_base + len(people)
+    N = sink + 1
+    din = Dinic(N)
 
+    # source -> slot
     for i in range(SLOTS):
         din.add_edge(src, slot_base + i, 1)
+
+    # slot -> person-date
     for i, sd in enumerate(slots):
-        role, d, sidx = sd
         for p in cand_per_slot[sd]:
-            pd_id = pd_index[(p, d)]
+            pd_id = pd_index[(p, sd[1])]
             din.add_edge(slot_base + i, pd_base + pd_id, 1)
+
+    # person-date -> person
     for (p, d), idx in pd_index.items():
         din.add_edge(pd_base + idx, person_base + people_idx[p], 1)
+
+    # person -> sink
     for p, pi in people_idx.items():
         din.add_edge(person_base + pi, sink, per_person_cap)
 
-    din.max_flow(src, sink)
+    flow = din.max_flow(src, sink)
 
+    # Decode assignments
     assigned = defaultdict(list)
     for i, sd in enumerate(slots):
         for v, cap, rev in din.adj[slot_base + i]:
@@ -315,6 +374,7 @@ def schedule_maxfill(long_df: pd.DataFrame,
                 pname, d = pd_list[pd_id]
                 assigned[(sd[0], d)].append((sd[2], pname))
 
+    # Assemble schedule_cells
     schedule_cells = {}
     for role, d, sidx in slots:
         key = (role, d)
@@ -328,109 +388,139 @@ def schedule_maxfill(long_df: pd.DataFrame,
             if 0 <= sidx < cap:
                 schedule_cells[key][sidx] = pname
 
+    # Metrics
+    unfilled = 0
+    priority_sum = 0
+    for (role, d), names in schedule_cells.items():
+        cap = int(capacity_df.loc[capacity_df['Role'] == role, 'Capacity'].iloc[0])
+        unfilled += max(0, cap - sum(1 for n in names if n))
+        # sum minimal priority each assigned got for that role/date (for tie-break scoring only)
+        mapped = role_map.get(role, [])
+        for n in names:
+            if not n: 
+                continue
+            best_pr = min((elig_by_person[n].get(rn, 99) for rn in mapped))
+            priority_sum += best_pr
+
+    # Counts
     assign_count = defaultdict(int)
     for (role, d), names in schedule_cells.items():
         for n in names:
-            if n: assign_count[n] += 1
+            if n:
+                assign_count[n] += 1
 
-    unfilled = []
-    for (role, d), names in schedule_cells.items():
-        missing = sum(1 for n in names if not n)
-        if missing > 0:
-            unfilled.append({"Role": role, "Date": d.strftime("%Y-%m-%d"), "MissingCount": missing})
-    unfilled_df = pd.DataFrame(unfilled)
+    return schedule_cells, dict(assign_count), unfilled, priority_sum
 
-    return schedule_cells, dict(assign_count), unfilled_df
+def best_of_n(long_df, availability, service_dates, capacity_df, role_map, per_person_cap, n_tries=BEST_OF_N, seed=RNG_SEED_BASE):
+    best = None
+    rng = np.random.default_rng(seed)
+    for t in range(n_tries):
+        local_rng = np.random.default_rng(int(seed + t*9973))
+        sc, counts, unfilled, prsum = run_flow_once(long_df, availability, service_dates, capacity_df, role_map, per_person_cap, rng=local_rng)
+        if (best is None) or (unfilled < best[2]) or (unfilled == best[2] and prsum < best[3]):
+            best = (sc, counts, unfilled, prsum)
+    return best
 
 def schedule_with_two_then_three(long_df, availability, service_dates, capacity_df, role_map):
-    sc1, counts1, unfilled1 = schedule_maxfill(long_df, availability, service_dates, capacity_df, role_map, per_person_cap=2)
+    sc1, counts1, unfilled1, prsum1 = best_of_n(long_df, availability, service_dates, capacity_df, role_map, per_person_cap=2)
     people = list({row['person'] for _, row in long_df.iterrows()})
     ratio_with_two = (sum(1 for p in people if counts1.get(p, 0) >= 2) / max(1, len(people)))
 
-    schedule_cells = sc1; counts = counts1; unfilled = unfilled1.copy()
+    schedule_cells = sc1
+    counts = counts1
 
-    if not unfilled1.empty and ratio_with_two >= MOST_PEOPLE_RATIO:
-        topup_people = {p for p in people if counts1.get(p, 0) == 2}
-        sc2, counts2_add, unfilled2 = schedule_maxfill(long_df, availability, service_dates, capacity_df, role_map, per_person_cap=1, restrict_people=topup_people)
+    if unfilled1 > 0 and ratio_with_two >= MOST_PEOPLE_RATIO:
+        topup_people = {p for p in people if counts.get(p, 0) == 2}
+        # Restrict long_df to topup_people for the 3rd pass
+        mask = long_df['person'].isin(list(topup_people))
+        long_df_topup = long_df[mask].copy()
+        sc2, counts2, unfilled2, prsum2 = best_of_n(long_df_topup, availability, service_dates, capacity_df, role_map, per_person_cap=1)
+        # merge sc2 into schedule_cells wherever sc1 has blanks
         for key, arr in schedule_cells.items():
             add_arr = sc2.get(key, [])
             for i in range(len(arr)):
                 if arr[i] == "" and i < len(add_arr) and add_arr[i] != "":
                     arr[i] = add_arr[i]
                     counts[arr[i]] = counts.get(arr[i], 0) + 1
-        unfilled = []
-        for (role, d), names in schedule_cells.items():
-            missing = sum(1 for n in names if not n)
-            if missing > 0:
-                unfilled.append({"Role": role, "Date": d.strftime("%Y-%m-%d"), "MissingCount": missing})
-        unfilled = pd.DataFrame(unfilled)
-    else:
-        unfilled = unfilled1
 
-    return schedule_cells, counts, unfilled, ratio_with_two
+    # After optional top-up, compute leftover unfilled
+    unfilled_rows = []
+    for (role, d), names in schedule_cells.items():
+        cap = int(capacity_df.loc[capacity_df['Role'] == role, 'Capacity'].iloc[0])
+        missing = max(0, cap - sum(1 for n in names if n))
+        if missing:
+            unfilled_rows.append({"Role": role, "Date": d.strftime("%Y-%m-%d"), "MissingCount": missing})
+    unfilled_df = pd.DataFrame(unfilled_rows)
+
+    return schedule_cells, counts, unfilled_df, ratio_with_two
 
 def group_label_for_age(age: int) -> str:
-    if age <= 3: return "Babies"
-    if age <= 6: return "Pre-School"
-    if age <= 8: return "Elementary"
+    if age <= 3:
+        return "Babies"
+    if age <= 6:
+        return "Pre-School"
+    if age <= 8:
+        return "Elementary"
     return "uGroup"
-
-# === Exact-ish header colors and widths from "August 2025" ===
-ROLE_HEADER_FILL = "#BDC0BF"   # Column A header fill
-DATE_HEADER_FILL = "#E3167D"   # Date headers fill
-# Column width sequence for A, B, C, ... repeating beyond available values
-COL_WIDTHS_SEQ = [21.57, 24.43, 26.86, 24.43, 13.00, 13.00, 13.00, 20.71, 16.43, 19.86, 19.43, 16.71, 16.57, 13.00, 20.71, 16.43, 15.71, 16.71, 13.00, 13.00]
 
 def export_schedule_like_template(writer, schedule_cells, capacity_df, service_dates):
     wb = writer.book
     ws = wb.add_worksheet("Schedule")
     writer.sheets["Schedule"] = ws
 
+    # Colors from your August 2025 sheet
+    role_header_fill = '#BDC0BF'  # Column A header
+    date_header_fill = '#E3167D'  # Date headers
+
     # Formats
-    header_role_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bottom': 1, 'bg_color': ROLE_HEADER_FILL})
-    header_date_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bottom': 1, 'bg_color': DATE_HEADER_FILL})
+    header_role_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bottom': 1, 'bg_color': role_header_fill, 'border': 1})
+    header_date_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bottom': 1, 'bg_color': date_header_fill, 'border': 1, 'font_color': 'white'})
     role_fmt = wb.add_format({'text_wrap': True, 'valign': 'top', 'border': 1})
     name_fmt = wb.add_format({'text_wrap': True, 'valign': 'top', 'border': 1})
     section_fmt = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'bg_color': '#D9D9D9', 'border': 1})
     spacer_fmt = wb.add_format({'bg_color': '#FFFFFF'})
 
-    # Set column widths (A + dates). If more columns than widths, cycle sequence.
-    total_cols = 1 + len(service_dates)
-    for col_idx in range(total_cols):
-        width = COL_WIDTHS_SEQ[col_idx % len(COL_WIDTHS_SEQ)]
-        if col_idx == 0:
-            ws.set_column(col_idx, col_idx, width, role_fmt)
-        else:
-            ws.set_column(col_idx, col_idx, width, name_fmt)
+    # Column widths approximated from template (A wide, date cols medium)
+    ws.set_column(0, 0, 21.57, role_fmt)   # Role col
+    ws.set_column(1, 1 + len(service_dates), 24.43, name_fmt)  # Date cols default
 
     # Header row
     ws.write(0, 0, "Role", header_role_fmt)
     for j, d in enumerate(service_dates, start=1):
         ws.write_datetime(0, j, d.to_pydatetime(), header_date_fmt)
 
-    # Ordered rows
     def add_admin_rows(rows):
-        for r in ["Oversight", "Main Director", "Director Roaming Inside", "Director Roaming Outside"]:
+        admin_roles = ["Oversight", "Main Director", "Director Roaming Inside", "Director Roaming Outside"]
+        for r in admin_roles:
             rows.append(("role", r))
         rows.append(("spacer", ""))
 
     def add_age_block(rows, age: int):
+        group = group_label_for_age(age)
         if age in (1, 4, 7, 9):
-            rows.append(("section", group_label_for_age(age)))
-        if age <= 3: leader_label = f"Babies Leader Age {age}"
-        elif age <= 6: leader_label = f"Pre-School Leader Age {age}"
-        elif age <= 8: leader_label = f"Elementary Leader Age {age}"
-        else: leader_label = f"uGroup Age {age}"
+            rows.append(("section", group))
+
+        if age <= 3:
+            leader_label = f"Babies Leader Age {age}"
+        elif age <= 6:
+            leader_label = f"Pre-School Leader Age {age}"
+        elif age <= 8:
+            leader_label = f"Elementary Leader Age {age}"
+        else:
+            leader_label = f"uGroup Age {age}"
         rows.append(("role", leader_label))
+
         vol_cap = int(capacity_df.loc[capacity_df["Role"] == f"Age {age} volunteers", "Capacity"].iloc[0])
         for _ in range(vol_cap):
             rows.append(("role", f"Age {age}"))
+
         if age <= 2:
             rows.append(("role", f"Age {age} nappies"))
             rows.append(("role", f"Age {age} bags girls"))
             rows.append(("role", f"Age {age} bags boys"))
         elif age == 3:
             rows.append(("role", "Age 3 bags"))
+
         rows.append(("spacer", ""))
 
     def add_special_needs(rows):
@@ -450,16 +540,26 @@ def export_schedule_like_template(writer, schedule_cells, capacity_df, service_d
             return schedule_cells[(label, d)]
         m = re.match(r"^(Babies Leader Age|Pre-School Leader Age|Elementary Leader Age|uGroup Age) (\d+)$", label)
         if m:
-            age = int(m.group(2)); return schedule_cells.get((f"Age {age} leader", d), [])
+            age = int(m.group(2))
+            cap_role = f"Age {age} leader"
+            return schedule_cells.get((cap_role, d), [])
         m2 = re.match(r"^Age (\d+)$", label)
         if m2:
-            age = int(m2.group(1)); return schedule_cells.get((f"Age {age} volunteers", d), [])
+            age = int(m2.group(1))
+            cap_role = f"Age {age} volunteers"
+            return schedule_cells.get((cap_role, d), [])
         if label.lower().startswith("age") and "nappies" in label.lower():
-            age = int(re.findall(r"\d+", label)[0]); return schedule_cells.get((f"Age {age} nappies", d), [])
+            age = int(re.findall(r"\d+", label)[0])
+            cap_role = f"Age {age} nappies"
+            return schedule_cells.get((cap_role, d), [])
         if label.lower().startswith("age") and "bags girls" in label.lower():
-            age = int(re.findall(r"\d+", label)[0]); return schedule_cells.get((f"Age {age} bags girls", d), [])
+            age = int(re.findall(r"\d+", label)[0])
+            cap_role = f"Age {age} bags girls"
+            return schedule_cells.get((cap_role, d), [])
         if label.lower().startswith("age") and "bags boys" in label.lower():
-            age = int(re.findall(r"\d+", label)[0]); return schedule_cells.get((f"Age {age} bags boys", d), [])
+            age = int(re.findall(r"\d+", label)[0])
+            cap_role = f"Age {age} bags boys"
+            return schedule_cells.get((cap_role, d), [])
         if label.lower() == "age 3 bags":
             return schedule_cells.get(("Age 3 bags", d), [])
         if label == "Special Needs":
@@ -470,24 +570,30 @@ def export_schedule_like_template(writer, schedule_cells, capacity_df, service_d
     for kind, label in ordered_rows:
         if kind == "section":
             ws.merge_range(excel_row, 0, excel_row, len(service_dates), f"  {label}", section_fmt)
-            excel_row += 1; continue
+            excel_row += 1
+            continue
         if kind == "spacer":
-            ws.write(excel_row, 0, "", spacer_fmt); excel_row += 1; continue
+            ws.write(excel_row, 0, "", spacer_fmt)
+            excel_row += 1
+            continue
+
         ws.write(excel_row, 0, label, role_fmt)
         for j, d in enumerate(service_dates, start=1):
             if re.fullmatch(r"Age \d+", label):
-                ws.write_string(excel_row, j, "", name_fmt)  # fill later
+                ws.write_string(excel_row, j, "", name_fmt)  # placeholder
             else:
                 names = names_for_label_and_date(label, d)
                 ws.write_string(excel_row, j, ", ".join([n for n in names if n]), name_fmt)
         excel_row += 1
 
-    # Second pass for volunteer rows
+    # Second pass for volunteers: put one slot per repeated "Age N" row
     row_map = []
     excel_row2 = 1
     for kind, label in ordered_rows:
-        if kind in ("section", "spacer"): continue
-        row_map.append((excel_row2, label)); excel_row2 += 1
+        if kind in ("section", "spacer"):
+            continue
+        row_map.append((excel_row2, label))
+        excel_row2 += 1
 
     from collections import defaultdict as dd
     per_date_written_count = dd(lambda: dd(int))
@@ -500,76 +606,113 @@ def export_schedule_like_template(writer, schedule_cells, capacity_df, service_d
                 ws.write_string(row_idx, j, val, name_fmt)
                 per_date_written_count[j][label] += 1
 
-    # Re-write headers as dates with desired format (already colored)
-    for j, d in enumerate(service_dates, start=1):
-        ws.write_datetime(0, j, d.to_pydatetime(), header_date_fmt)
+    return ws
 
 def expand_to_slot_rows(capacity_df: pd.DataFrame, service_dates: List[pd.Timestamp], schedule_cells: Dict[tuple, list]) -> pd.DataFrame:
-    rows = []; index_labels = []; date_cols = [d.strftime('%Y-%m-%d') for d in service_dates]
+    rows = []
+    index_labels = []
+    date_cols = [d.strftime('%Y-%m-%d') for d in service_dates]
+
     for _, crow in capacity_df.iterrows():
-        cap_role = str(crow['Role']).strip(); cap = int(crow['Capacity'])
+        cap_role = str(crow['Role']).strip()
+        cap = int(crow['Capacity'])
         is_volunteers = cap_role.lower().endswith('volunteers')
         base_label = cap_role[:-10].strip() if is_volunteers else cap_role
+
         if cap_role.endswith('leader'):
             age_num = ''.join([c for c in cap_role if c.isdigit()])
             if age_num:
                 n = int(age_num)
-                if n <= 3: base_label = f"Babies Leader Age {n}"
-                elif n <= 6: base_label = f"Pre-School Leader Age {n}"
-                elif n <= 8: base_label = f"Elementary Leader Age {n}"
-                else: base_label = f"uGroup Age {n}"
+                if n <= 3:
+                    base_label = f"Babies Leader Age {n}"
+                elif n <= 6:
+                    base_label = f"Pre-School Leader Age {n}"
+                elif n <= 8:
+                    base_label = f"Elementary Leader Age {n}"
+                else:
+                    base_label = f"uGroup Age {n}"
+
         if cap_role.lower().startswith('special needs'):
             base_label = "Special Needs"
+
         for slot_idx in range(cap):
             row = {}
             for d in service_dates:
                 names = schedule_cells.get((cap_role, d), [])
                 row[d.strftime('%Y-%m-%d')] = names[slot_idx] if slot_idx < len(names) else ''
-            rows.append(row); index_labels.append(base_label)
-    disp = pd.DataFrame(rows, columns=date_cols); disp.index = index_labels; disp.index.name = "Role"
+            rows.append(row)
+            index_labels.append(base_label)
+
+    disp = pd.DataFrame(rows, columns=date_cols)
+    disp.index = index_labels
+    disp.index.name = "Role"
     return disp
 
 def build_availability_counts_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
-    people_pool = sorted(long_df['person'].unique()); records = []
+    people_pool = sorted(long_df['person'].unique())
+    records = []
     for p in people_pool:
         yes_dates = [d for d in service_dates if availability.get(p, {}).get(d, False)]
-        records.append({"Person": p, "YesCount": len(yes_dates), "YesDates": ", ".join(sorted(d.strftime('%Y-%m-%d') for d in yes_dates)), "MissingToTwo": max(0, 2-len(yes_dates))})
+        records.append({
+            "Person": p,
+            "YesCount": len(yes_dates),
+            "YesDates": ", ".join(sorted(d.strftime('%Y-%m-%d') for d in yes_dates)),
+            "MissingToTwo": max(0, 2 - len(yes_dates)),
+        })
     return pd.DataFrame(records)
 
+def build_low_availability_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
+    df = build_availability_counts_df(long_df, availability, service_dates)
+    return df[df["YesCount"] <= 2].sort_values(["YesCount", "Person"]).reset_index(drop=True)
+
 # ------------------------------
-# UI
+# UI (everything on page)
 # ------------------------------
 st.subheader("1) Upload files (single month only)")
-c1, c2 = st.columns(2)
-with c1:
+col1, col2 = st.columns(2)
+with col1:
     people_file = st.file_uploader("Serving positions (Excel)", type=["xlsx", "xls"], key="people_file")
-with c2:
+with col2:
     responses_file = st.file_uploader("Form responses (Excel)", type=["xlsx", "xls"], key="responses_file")
 
-if st.button("Generate Schedule", type="primary"):
+# Optional: allow changing Best-of-N for deeper search
+BEST_OF_N = st.slider("Search depth (Best-of-N)", 5, 100, BEST_OF_N, 5, help="Higher tries more tie-break variants to reduce unfilled roles.")
+
+run_btn = st.button("Generate Schedule", type="primary")
+
+if run_btn:
     if not people_file or not responses_file:
-        st.error("Please upload both files."); st.stop()
+        st.error("Please upload both the serving positions and the form responses files.")
+        st.stop()
 
     people_df = pd.read_excel(people_file)
     responses_df = pd.read_excel(responses_file)
+
     cap_df = pd.DataFrame(DEFAULT_CAPACITIES)
 
     name_col_people = detect_name_column(people_df)
     name_col_resp = detect_name_column(responses_df)
     role_cols = [c for c in people_df.columns if c != name_col_people and is_priority_col(people_df[c])]
     if not role_cols:
-        st.error("No role columns with priorities (0-5) detected."); st.stop()
+        st.error("No role columns with priorities (0-5) detected in the serving positions file.")
+        st.stop()
 
     long_df = build_long_df(people_df, name_col_people, role_cols)
     if long_df.empty:
-        st.error("No eligible assignments found."); st.stop()
+        st.error("No eligible assignments found (all priorities are 0 or missing).")
+        st.stop()
 
     try:
         year, month, date_map = parse_month_and_dates_from_headers(responses_df)
     except Exception as e:
-        st.error(f"Could not parse month & dates from responses: {e}"); st.stop()
+        st.error(f"Could not parse month & dates from responses: {e}")
+        st.stop()
 
     availability, service_dates = parse_availability(responses_df, name_col_resp, date_map)
+
+    all_avail_df = build_availability_counts_df(long_df, availability, service_dates)
+    low_avail_df = all_avail_df[all_avail_df["YesCount"] <= 2].copy().reset_index(drop=True)
+
     role_map = map_capacity_roles_to_sheet(cap_df, role_cols)
 
     schedule_cells, assign_count, unfilled_df, ratio_with_two = schedule_with_two_then_three(
@@ -577,21 +720,44 @@ if st.button("Generate Schedule", type="primary"):
     )
 
     st.success(f"Schedule generated for {date(service_dates[0].year, service_dates[0].month, 1):%B %Y}!")
-    st.dataframe(expand_to_slot_rows(cap_df, service_dates, schedule_cells), use_container_width=True)
 
+    st.subheader("2) Schedule (preview)")
+    slot_disp = expand_to_slot_rows(cap_df, service_dates, schedule_cells)
+    st.dataframe(slot_disp, use_container_width=True)
+
+    st.subheader("Assignment Summary")
     summary_df = pd.Series(assign_count, name="AssignedCount").rename_axis("Person").reset_index()
-    st.dataframe(summary_df.sort_values(['AssignedCount','Person'], ascending=[False, True]), use_container_width=True)
+    st.dataframe(summary_df.sort_values(["AssignedCount","Person"], ascending=[False, True]), use_container_width=True)
 
-    # Export
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter", datetime_format="dd mmm") as writer:
+    if not unfilled_df.empty:
+        st.warning("Some slots could not be filled under the rules:")
+        st.dataframe(unfilled_df, use_container_width=True)
+
+    if not low_avail_df.empty:
+        st.warning(f"People not available for more than 2 dates (YesCount ≤ 2): {len(low_avail_df)}")
+        st.dataframe(low_avail_df, use_container_width=True)
+
+    out_xlsx = io.BytesIO()
+    with pd.ExcelWriter(out_xlsx, engine="xlsxwriter", datetime_format="dd mmm") as writer:
         export_schedule_like_template(writer, schedule_cells, cap_df, service_dates)
-        simple_summary = summary_df[["Person","AssignedCount"]].copy()
+
+        simple_summary = summary_df[["Person", "AssignedCount"]].copy()
         simple_summary.to_excel(writer, sheet_name="AssignmentSummary", index=False)
-        wb = writer.book; ws2 = writer.sheets["AssignmentSummary"]
+        wb = writer.book
+        ws2 = writer.sheets["AssignmentSummary"]
         wrap = wb.add_format({"text_wrap": True, "valign": "top"})
-        ws2.set_column(0, 0, 28, wrap); ws2.set_column(1, 1, 14, wrap)
-    out.seek(0)
-    st.download_button("Download Excel (.xlsx)", data=out, file_name=f"uKids_schedule_{year}_{month:02d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        ws2.set_column(0, 0, 28, wrap)
+        ws2.set_column(1, 1, 14, wrap)
+
+        if not low_avail_df.empty:
+            low_avail_df.to_excel(writer, sheet_name="LowAvailability", index=False)
+            ws3 = writer.sheets["LowAvailability"]
+            ws3.set_column(0, 0, 28, wrap)
+            ws3.set_column(1, 3, 20, wrap)
+
+    out_xlsx.seek(0)
+    st.download_button("Download Excel (.xlsx)", data=out_xlsx, file_name=f"uKids_schedule_{year}_{month:02d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 else:
-    st.info("Upload positions + responses for a single month, then click Generate.")
+    st.info("Upload the two Excel files for a single month and click **Generate Schedule**. "
+            "The app detects the month automatically from headers like 'Are you available 7 September?'.")
