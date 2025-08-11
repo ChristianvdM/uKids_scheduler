@@ -7,6 +7,10 @@ import numpy as np
 import streamlit as st
 from datetime import datetime, date
 from typing import Dict, List, Tuple
+from collections import defaultdict
+from datetime import datetime
+from io import BytesIO
+import base64
 
 st.set_page_config(page_title='uKids Scheduler', layout='wide')
 st.title('uKids Children Scheduler')
@@ -258,5 +262,6 @@ if run_btn:
     st.write(f'People with > 2 assignments: {len(over)} (should be 0)')
 else:
     st.info('Upload the two Excel files on the left, set month/year and rule, then click **Generate Schedule**.')
+
 
 
