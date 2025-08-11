@@ -1,4 +1,9 @@
-# Streamlit app for uKids Children Scheduler (Max-Fill, Deterministic) + LowAvailability export + Inline Flags
+# Streamlit app for uKids Children Scheduler (Max-Fill, Deterministic)
+# - Leaders included
+# - LowAvailability = YesCount <= 2
+# - AssignmentSummary sheet shows only Person and AssignedCount
+# - No "Capacities" sheet exported
+# - Excel export auto-fits column widths and wraps text to show full contents
 # Save as ukids_scheduler_app.py and run with: streamlit run ukids_scheduler_app.py
 
 import io
@@ -6,7 +11,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from datetime import datetime, date
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 import base64
 import re
 from collections import defaultdict
@@ -21,6 +26,7 @@ st.markdown(
         body { background-color: #000000; color: white; }
         .stApp { background-color: #000000; }
         .stButton>button, .stDownloadButton>button { background-color: #444; color: white; }
+        .stDataFrame { font-size: 14px; }
     </style>
     """,
     unsafe_allow_html=True
@@ -63,28 +69,49 @@ MONTH_ALIASES = {
 
 YES_SET = {"yes", "y", "true", "available"}
 
-# Default capacities (hidden; not shown in UI)
+# Capacities (leaders included). These are internal; not shown and not exported.
 DEFAULT_CAPACITIES = [
+    {"Role": "Age 1 leader", "Capacity": 1},
     {"Role": "Age 1 volunteers", "Capacity": 5},
     {"Role": "Age 1 nappies", "Capacity": 1},
     {"Role": "Age 1 bags girls", "Capacity": 1},
     {"Role": "Age 1 bags boys", "Capacity": 1},
+
+    {"Role": "Age 2 leader", "Capacity": 1},
     {"Role": "Age 2 volunteers", "Capacity": 4},
     {"Role": "Age 2 nappies", "Capacity": 1},
     {"Role": "Age 2 bags girls", "Capacity": 1},
     {"Role": "Age 2 bags boys", "Capacity": 1},
+
+    {"Role": "Age 3 leader", "Capacity": 1},
     {"Role": "Age 3 volunteers", "Capacity": 4},
     {"Role": "Age 3 bags", "Capacity": 1},
+
+    {"Role": "Age 4 leader", "Capacity": 1},
     {"Role": "Age 4 volunteers", "Capacity": 4},
+
+    {"Role": "Age 5 leader", "Capacity": 1},
     {"Role": "Age 5 volunteers", "Capacity": 3},
+
+    {"Role": "Age 6 leader", "Capacity": 1},
     {"Role": "Age 6 volunteers", "Capacity": 3},
+
+    {"Role": "Age 7 leader", "Capacity": 1},
     {"Role": "Age 7 volunteers", "Capacity": 2},
+
+    {"Role": "Age 8 leader", "Capacity": 1},
     {"Role": "Age 8 volunteers", "Capacity": 2},
+
+    {"Role": "Age 9 leader", "Capacity": 1},
     {"Role": "Age 9 volunteers", "Capacity": 2},
+
+    {"Role": "Age 10 leader", "Capacity": 1},
     {"Role": "Age 10 volunteers", "Capacity": 1},
+
+    {"Role": "Age 11 leader", "Capacity": 1},
     {"Role": "Age 11 volunteers", "Capacity": 1},
+
     {"Role": "Special needs volunteers", "Capacity": 2},
-    # Add leader rows here if desired, e.g. {"Role": "Age 1 leader", "Capacity": 1},
 ]
 
 def normalize(s: str) -> str:
@@ -165,17 +192,39 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map:
     return availability, service_dates
 
 def map_capacity_roles_to_sheet(cap_df: pd.DataFrame, people_role_cols: List[str]) -> Dict[str, List[str]]:
-    sheet_norm = {normalize(c): c for c in people_role_cols}
+    def tokenize(s: str):
+        return normalize(s).split()
+
+    def matches_tokens(cap_tokens, sheet_tokens):
+        IGNORE = {"volunteers", "volunteer", "helpers", "helper"}
+        sheet_set = set(sheet_tokens)
+        for tok in cap_tokens:
+            if tok in IGNORE:
+                continue
+            base = tok[:-1] if tok.endswith('s') else tok
+            variants = {tok, base, base + 's'}
+            if base.endswith('ie'):
+                variants.add(base[:-2] + 'y')
+            if base.endswith('y'):
+                variants.add(base[:-1] + 'ies')
+            if not any(v in sheet_set for v in variants):
+                return False
+        return True
+
+    sheet_norm_map = {normalize(c): c for c in people_role_cols}
+    sheet_token_map = {k: tokenize(k) for k in sheet_norm_map.keys()}
+
     mapping: Dict[str, List[str]] = {}
     for _, row in cap_df.iterrows():
         cap_role = str(row["Role"]).strip()
-        norm = normalize(cap_role)
+        cap_norm = normalize(cap_role)
+        cap_tokens = tokenize(cap_norm)
         matches = []
-        if norm in sheet_norm:
-            matches = [sheet_norm[norm]]
+        if cap_norm in sheet_norm_map:
+            matches = [sheet_norm_map[cap_norm]]
         else:
-            for k_norm, original in sheet_norm.items():
-                if all(tok in k_norm for tok in norm.split() if tok not in {"volunteers", "volunteer"}):
+            for k_norm, original in sheet_norm_map.items():
+                if matches_tokens(cap_tokens, sheet_token_map[k_norm]):
                     matches.append(original)
         mapping[cap_role] = sorted(set(matches))
     return mapping
@@ -184,19 +233,19 @@ def map_capacity_roles_to_sheet(cap_df: pd.DataFrame, people_role_cols: List[str
 # Max-Flow (Dinic) for max-fill scheduling
 # ------------------------------
 class Dinic:
-    def __init__(self, N):
+    def __init__(self, N: int):
         self.N = N
         self.adj = [[] for _ in range(N)]
-        self.level = [0]*self.N
-        self.it = [0]*self.N
+        self.level = [0] * N
+        self.it = [0] * N
 
-    def add_edge(self, u, v, cap):
+    def add_edge(self, u: int, v: int, cap: int):
         self.adj[u].append([v, cap, len(self.adj[v])])
-        self.adj[v].append([u, 0, len(self.adj[u])-1])
+        self.adj[v].append([u, 0, len(self.adj[u]) - 1])
 
-    def bfs(self, s, t):
+    def bfs(self, s: int, t: int) -> bool:
         from collections import deque
-        self.level = [-1]*self.N
+        self.level = [-1] * self.N
         q = deque([s])
         self.level[s] = 0
         while q:
@@ -207,7 +256,7 @@ class Dinic:
                     q.append(v)
         return self.level[t] >= 0
 
-    def dfs(self, u, t, f):
+    def dfs(self, u: int, t: int, f: int) -> int:
         if u == t:
             return f
         for i in range(self.it[u], len(self.adj[u])):
@@ -221,11 +270,11 @@ class Dinic:
                     return d
         return 0
 
-    def max_flow(self, s, t):
+    def max_flow(self, s: int, t: int) -> int:
         flow = 0
-        INF = 10**9
+        INF = 10 ** 9
         while self.bfs(s, t):
-            self.it = [0]*self.N
+            self.it = [0] * self.N
             f = self.dfs(s, t, INF)
             while f > 0:
                 flow += f
@@ -238,29 +287,29 @@ def schedule_maxfill(long_df: pd.DataFrame,
                      capacity_df: pd.DataFrame,
                      role_map: Dict[str, List[str]],
                      per_person_cap: int,
-                     restrict_people: set = None):
-    people = sorted(long_df['person'].unique())
-    if restrict_people is not None:
-        people = [p for p in people if p in restrict_people]
-    people_idx = {p:i for i,p in enumerate(people)}
+                     restrict_people: Set[str] | None = None):
+    """Maximize filled slots using a deterministic max-flow model."""
+    people_all = sorted(long_df['person'].unique())
+    people = [p for p in people_all if (restrict_people is None or p in restrict_people)]
+    people_idx = {p: i for i, p in enumerate(people)}
 
-    # Precompute eligibility best priority per person for each capacity role
+    # Eligibility map
     elig_by_person = {}
     for p in people:
         sub = long_df[long_df['person'] == p]
         pr_map = {row['role']: int(row['priority']) for _, row in sub.iterrows()}
         elig_by_person[p] = pr_map
 
-    # Build slot list deterministically
+    # Build slots (role, date, slot_idx)
     role_names = [str(r['Role']).strip() for _, r in capacity_df.iterrows()]
-    slots = []  # (role, date, slot_idx)
+    slots = []
     for role in role_names:
         cap = int(capacity_df.loc[capacity_df['Role'] == role, 'Capacity'].iloc[0])
         for d in service_dates:
             for sidx in range(cap):
                 slots.append((role, d, sidx))
 
-    # Person-date pairs
+    # Candidate edges: slot -> (person, date) where available & eligible
     pd_pairs = set()
     cand_per_slot = {}
     for role, d, sidx in slots:
@@ -277,12 +326,14 @@ def schedule_maxfill(long_df: pd.DataFrame,
                 best_pr = min(prs)  # 1 best
                 cands.append((best_pr, p))
                 pd_pairs.add((p, d))
-        cands.sort(key=lambda x: (x[0], x[1]))
+        cands.sort(key=lambda x: (x[0], x[1]))  # deterministic: priority then name
         cand_per_slot[(role, d, sidx)] = [p for _, p in cands]
 
     # Build graph
     SLOTS = len(slots)
-    pd_index = {pd:i for i,pd in enumerate(sorted(pd_pairs, key=lambda x: (x[1], x[0])))}  # sort by date then person
+    pd_list = sorted(pd_pairs, key=lambda x: (x[1], x[0]))  # (person,date) sorted by date then person
+    pd_index = {pd: i for i, pd in enumerate(pd_list)}
+
     src = 0
     slot_base = 1
     pd_base = slot_base + SLOTS
@@ -292,20 +343,21 @@ def schedule_maxfill(long_df: pd.DataFrame,
     din = Dinic(N)
 
     # source -> slot
-    for i, sd in enumerate(slots):
+    for i in range(SLOTS):
         din.add_edge(src, slot_base + i, 1)
 
     # slot -> person-date
     for i, sd in enumerate(slots):
+        role, d, sidx = sd
         for p in cand_per_slot[sd]:
-            pd_id = pd_index[(p, sd[1])]
+            pd_id = pd_index[(p, d)]
             din.add_edge(slot_base + i, pd_base + pd_id, 1)
 
-    # person-date -> person
+    # person-date -> person (one assignment per date per person)
     for (p, d), idx in pd_index.items():
         din.add_edge(pd_base + idx, person_base + people_idx[p], 1)
 
-    # person -> sink
+    # person -> sink (limit total assignments)
     for p, pi in people_idx.items():
         din.add_edge(person_base + pi, sink, per_person_cap)
 
@@ -315,9 +367,9 @@ def schedule_maxfill(long_df: pd.DataFrame,
     assigned = defaultdict(list)  # key: (role, d) -> list of (sidx, name)
     for i, sd in enumerate(slots):
         for v, cap, rev in din.adj[slot_base + i]:
-            if v >= pd_base and v < person_base and cap == 0:
+            if pd_base <= v < person_base and cap == 0:
                 pd_id = v - pd_base
-                (pname, d) = list(pd_index.keys())[pd_id]
+                pname, d = pd_list[pd_id]
                 assigned[(sd[0], d)].append((sd[2], pname))
 
     # Assemble schedule_cells with slot order
@@ -334,7 +386,7 @@ def schedule_maxfill(long_df: pd.DataFrame,
             if 0 <= sidx < cap:
                 schedule_cells[key][sidx] = pname
 
-    # Build counts
+    # Counts
     assign_count = defaultdict(int)
     for (role, d), names in schedule_cells.items():
         for n in names:
@@ -352,6 +404,7 @@ def schedule_maxfill(long_df: pd.DataFrame,
     return schedule_cells, dict(assign_count), unfilled_df
 
 def schedule_with_two_then_three(long_df, availability, service_dates, capacity_df, role_map):
+    # Pass 1: cap 2
     sc1, counts1, unfilled1 = schedule_maxfill(long_df, availability, service_dates, capacity_df, role_map, per_person_cap=2)
     people = list({row['person'] for _, row in long_df.iterrows()})
     ratio_with_two = (sum(1 for p in people if counts1.get(p, 0) >= 2) / max(1, len(people)))
@@ -360,10 +413,12 @@ def schedule_with_two_then_three(long_df, availability, service_dates, capacity_
     counts = counts1
     unfilled = unfilled1.copy()
 
+    # Pass 2 (optional): allow +1 for people with exactly 2
     if not unfilled1.empty and ratio_with_two >= MOST_PEOPLE_RATIO:
         topup_people = {p for p in people if counts1.get(p, 0) == 2}
         sc2, counts2_add, unfilled2 = schedule_maxfill(long_df, availability, service_dates, capacity_df, role_map, per_person_cap=1, restrict_people=topup_people)
 
+        # merge: fill only blanks
         for key, arr in schedule_cells.items():
             add_arr = sc2.get(key, [])
             for i in range(len(arr)):
@@ -371,6 +426,7 @@ def schedule_with_two_then_three(long_df, availability, service_dates, capacity_
                     arr[i] = add_arr[i]
                     counts[arr[i]] = counts.get(arr[i], 0) + 1
 
+        # recompute unfilled
         unfilled = []
         for (role, d), names in schedule_cells.items():
             missing = sum(1 for n in names if not n)
@@ -382,31 +438,111 @@ def schedule_with_two_then_three(long_df, availability, service_dates, capacity_
 
     return schedule_cells, counts, unfilled, ratio_with_two
 
+
+def _age_band_label(age: int) -> str:
+    if 1 <= age <= 3:
+        return "Babies Leader Age " + str(age) if age <= 3 else ""
+    elif 4 <= age <= 6:
+        return "Pre-School Leader Age " + str(age)
+    elif 7 <= age <= 8:
+        return "Elementary Leader Age " + str(age)
+    else:
+        return "uGroup Age " + str(age)
+
+def _display_label(cap_role: str, slot_idx: int) -> str:
+    s = cap_role.lower().strip()
+    # Directors and oversight
+    if s in {"oversight", "main director", "director roaming inside", "director roaming outside"}:
+        return cap_role
+    # Special needs
+    if s.startswith("special needs"):
+        return "Special Needs"
+    # Age-specific
+    m = re.match(r"age\s*(\d+)\s*(.*)", s)
+    if m:
+        age = int(m.group(1))
+        tail = m.group(2).strip()
+        if tail == "leader":
+            return _age_band_label(age)
+        elif "napp" in tail:
+            return f"Age {age} Nappies"
+        elif "bags girls" in tail:
+            return f"Age {age} Bags Girls"
+        elif "bags boys" in tail:
+            return f"Age {age} Bags Boys"
+        elif "bags" in tail:
+            return f"Age {age} Bags"
+        else:
+            return f"Age {age}"
+    # Fallback
+    return cap_role
+
 def expand_to_slot_rows(capacity_df: pd.DataFrame, service_dates: List[pd.Timestamp], schedule_cells: Dict[tuple, list]) -> pd.DataFrame:
+    """Return a display table with one row per slot (dates as columns) with labels similar to 'August 2025' template."""
     rows = []
     index_labels = []
     date_cols = [d.strftime('%Y-%m-%d') for d in service_dates]
 
-    for _, crow in capacity_df.iterrows():
-        cap_role = str(crow['Role']).strip()
-        cap = int(crow['Capacity'])
-        is_volunteers = cap_role.lower().endswith('volunteers')
-        base_label = cap_role[:-10].strip() if is_volunteers else cap_role  # remove 'volunteers'
+    # Define ordering similar to template
+    order_keys = []
+    # Leadership block
+    for role in ["Oversight", "Main Director", "Director Roaming Inside", "Director Roaming Outside"]:
+        if role in capacity_df["Role"].values:
+            order_keys.append(role)
+    # Ages 1..11 blocks (leader first, then volunteers & extras)
+    for age in range(1, 12):
+        # leader
+        r = f"Age {age} leader"
+        if r in capacity_df["Role"].str.lower().values:
+            # find exact case role
+            exact = capacity_df["Role"][capacity_df["Role"].str.lower()==r].iloc[0]
+            order_keys.append(exact)
+        # volunteers
+        rv = f"Age {age} volunteers"
+        if rv in capacity_df["Role"].str.lower().values:
+            order_keys.append(capacity_df["Role"][capacity_df["Role"].str.lower()==rv].iloc[0])
+        # nappies/bags
+        for tail in ["nappies", "bags girls", "bags boys", "bags"]:
+            rx = f"Age {age} {tail}"
+            mask = capacity_df["Role"].str.lower()==rx
+            if mask.any():
+                order_keys.append(capacity_df["Role"][mask].iloc[0])
+    # Special needs at end
+    if "Special needs volunteers" in capacity_df["Role"].str.lower().values:
+        order_keys.append(capacity_df["Role"][capacity_df["Role"].str.lower()=="special needs volunteers"].iloc[0])
 
+    # Deduplicate while preserving order, include any remainder
+    seen = set()
+    ordered_roles = []
+    for r in order_keys:
+        if r not in seen:
+            seen.add(r); ordered_roles.append(r)
+    for r in capacity_df["Role"]:
+        if r not in seen:
+            ordered_roles.append(r)
+
+    # Build rows
+    for cap_role in ordered_roles:
+        cap = int(capacity_df.loc[capacity_df["Role"] == cap_role, "Capacity"].iloc[0])
         for slot_idx in range(cap):
             row = {}
             for d in service_dates:
                 names = schedule_cells.get((cap_role, d), [])
                 row[d.strftime('%Y-%m-%d')] = names[slot_idx] if slot_idx < len(names) else ''
             rows.append(row)
-            index_labels.append(base_label)
+            index_labels.append(_display_label(cap_role, slot_idx))
 
     disp = pd.DataFrame(rows, columns=date_cols)
     disp.index = index_labels
+
+    # Make header top row contain dates exactly as in template (dates, not strings) when exporting
+    disp.columns = [pd.to_datetime(c) for c in disp.columns]
+
     return disp
 
+
 def build_availability_counts_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
-    """Availability counts for ALL eligible people (from serving positions with priority >=1 on at least one role)."""
+    """Availability counts for ALL eligible people (priority >=1 on at least one role)."""
     people_pool = sorted(long_df['person'].unique())
     records = []
     for p in people_pool:
@@ -420,8 +556,9 @@ def build_availability_counts_df(long_df: pd.DataFrame, availability: Dict[str, 
     return pd.DataFrame(records)
 
 def build_low_availability_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
+    """People who are NOT available for more than 2 dates => YesCount <= 2."""
     df = build_availability_counts_df(long_df, availability, service_dates)
-    return df[df["YesCount"] < 2].sort_values(["YesCount", "Person"]).reset_index(drop=True)
+    return df[df["YesCount"] <= 2].sort_values(["YesCount", "Person"]).reset_index(drop=True)
 
 # ------------------------------
 # UI (everything on page)
@@ -440,6 +577,7 @@ if run_btn:
         st.error("Please upload both the serving positions and the form responses files.")
         st.stop()
 
+    # NOTE: Reading .xlsx requires the 'openpyxl' package on deployment.
     people_df = pd.read_excel(people_file)
     responses_df = pd.read_excel(responses_file)
 
@@ -465,9 +603,9 @@ if run_btn:
 
     availability, service_dates = parse_availability(responses_df, name_col_resp, date_map)
 
-    # Availability diagnostics
+    # Availability diagnostics (<=2 Yes dates)
     all_avail_df = build_availability_counts_df(long_df, availability, service_dates)
-    low_avail_df = all_avail_df[all_avail_df["YesCount"] < 2].copy().reset_index(drop=True)
+    low_avail_df = all_avail_df[all_avail_df["YesCount"] <= 2].copy().reset_index(drop=True)
 
     role_map = map_capacity_roles_to_sheet(cap_df, role_cols)
 
@@ -482,34 +620,58 @@ if run_btn:
     st.dataframe(slot_disp, use_container_width=True)
 
     st.subheader("Assignment Summary")
-    # Merge counts with availability info and add Flag
+    # Only show Person + AssignedCount in the sheet; keep on-page view the same two columns
     summary_df = pd.Series(assign_count, name="AssignedCount").rename_axis("Person").reset_index()
-    summary_df = summary_df.merge(all_avail_df, on="Person", how="left")
-    summary_df["YesCount"] = summary_df["YesCount"].fillna(0).astype(int)
-    summary_df["MissingToTwo"] = summary_df["MissingToTwo"].fillna(2).astype(int)
-    summary_df["YesDates"] = summary_df["YesDates"].fillna("")
-    summary_df["Flag"] = np.where(summary_df["YesCount"] < 2, "⚠️ Low availability", "")
-    summary_df = summary_df.sort_values(by=["Flag", "MissingToTwo", "Person"], ascending=[False, False, True])
-    st.dataframe(summary_df, use_container_width=True)
-
-    st.info(f"{ratio_with_two:.0%} of people reached 2 assignments. "
-            f"{'A 3rd-pass fill was applied.' if ratio_with_two >= MOST_PEOPLE_RATIO else 'No 3rd-pass fill applied (threshold 80%).'}")
+    st.dataframe(summary_df.sort_values(["AssignedCount","Person"], ascending=[False, True]), use_container_width=True)
 
     if not unfilled_df.empty:
         st.warning("Some slots could not be filled under the rules:")
         st.dataframe(unfilled_df, use_container_width=True)
 
+    # Show ONLY the people not available for more than 2 dates
     if not low_avail_df.empty:
-        st.warning(f"{len(low_avail_df)} people said 'Yes' to fewer than 2 dates (see 'LowAvailability' sheet in the export).")
+        st.warning(f"People not available for more than 2 dates (YesCount ≤ 2): {len(low_avail_df)}")
         st.dataframe(low_avail_df, use_container_width=True)
 
-    # Downloads (export per-slot rows + LowAvailability + enriched AssignmentSummary)
+    # ---------- Downloads (no Capacities sheet) ----------
+    def _autofit(worksheet, df, index=True):
+        # Estimate optimal column widths; wrap long text
+        wrap = worksheet.book.add_format({'text_wrap': True})
+        # Determine number of columns including index col if present
+        start_col = 0
+        cols = []
+        if index:
+            # Pandas writes the index with a blank header
+            idx_name = df.index.name if df.index.name else ""
+            idx_vals = [str(x) if x is not None else "" for x in df.index.to_list()]
+            cols.append([idx_name] + idx_vals)
+        for c in df.columns:
+            vals = [str(c)] + ["" if pd.isna(v) else str(v) for v in df[c].tolist()]
+            cols.append(vals)
+        for i, col_vals in enumerate(cols):
+            max_len = max((len(s) for s in col_vals), default=0)
+            width = min(80, max(12, int(max_len * 1.1)))
+            worksheet.set_column(i, i, width, wrap)
+
     out_xlsx = io.BytesIO()
     with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
+        # Schedule sheet (index=True)
         slot_disp.to_excel(writer, sheet_name="Schedule", index=True)
-        summary_df.to_excel(writer, sheet_name="AssignmentSummary", index=False)
-        cap_df.to_excel(writer, sheet_name="Capacities", index=False)
-        low_avail_df.to_excel(writer, sheet_name="LowAvailability", index=False)
+        ws = writer.sheets["Schedule"]
+        _autofit(ws, slot_disp, index=True)
+
+        # AssignmentSummary sheet (ONLY Person + AssignedCount)
+        simple_summary = summary_df[["Person", "AssignedCount"]].copy()
+        simple_summary.to_excel(writer, sheet_name="AssignmentSummary", index=False)
+        ws2 = writer.sheets["AssignmentSummary"]
+        _autofit(ws2, simple_summary, index=False)
+
+        # LowAvailability sheet
+        if not low_avail_df.empty:
+            low_avail_df.to_excel(writer, sheet_name="LowAvailability", index=False)
+            ws3 = writer.sheets["LowAvailability"]
+            _autofit(ws3, low_avail_df, index=False)
+
     out_xlsx.seek(0)
 
     out_csv = io.StringIO()
@@ -522,4 +684,3 @@ if run_btn:
 else:
     st.info("Upload the two Excel files for a single month and click **Generate Schedule**. "
             "The app detects the month automatically from headers like 'Are you available 7 September?'.")
-
