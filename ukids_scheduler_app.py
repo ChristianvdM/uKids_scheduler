@@ -1,3 +1,4 @@
+
 # Streamlit app for uKids Children Scheduler (Max-Fill, Deterministic)
 # - Leaders included
 # - LowAvailability = YesCount <= 2
@@ -71,6 +72,11 @@ YES_SET = {"yes", "y", "true", "available"}
 
 # Capacities (leaders included). These are internal; not shown and not exported.
 DEFAULT_CAPACITIES = [
+    {"Role": "Oversight", "Capacity": 1},
+    {"Role": "Main Director", "Capacity": 1},
+    {"Role": "Director Roaming Inside", "Capacity": 1},
+    {"Role": "Director Roaming Outside", "Capacity": 1},
+
     {"Role": "Age 1 leader", "Capacity": 1},
     {"Role": "Age 1 volunteers", "Capacity": 5},
     {"Role": "Age 1 nappies", "Capacity": 1},
@@ -438,108 +444,47 @@ def schedule_with_two_then_three(long_df, availability, service_dates, capacity_
 
     return schedule_cells, counts, unfilled, ratio_with_two
 
-
-def _age_band_label(age: int) -> str:
-    if 1 <= age <= 3:
-        return "Babies Leader Age " + str(age) if age <= 3 else ""
-    elif 4 <= age <= 6:
-        return "Pre-School Leader Age " + str(age)
-    elif 7 <= age <= 8:
-        return "Elementary Leader Age " + str(age)
-    else:
-        return "uGroup Age " + str(age)
-
-def _display_label(cap_role: str, slot_idx: int) -> str:
-    s = cap_role.lower().strip()
-    # Directors and oversight
-    if s in {"oversight", "main director", "director roaming inside", "director roaming outside"}:
-        return cap_role
-    # Special needs
-    if s.startswith("special needs"):
-        return "Special Needs"
-    # Age-specific
-    m = re.match(r"age\s*(\d+)\s*(.*)", s)
-    if m:
-        age = int(m.group(1))
-        tail = m.group(2).strip()
-        if tail == "leader":
-            return _age_band_label(age)
-        elif "napp" in tail:
-            return f"Age {age} Nappies"
-        elif "bags girls" in tail:
-            return f"Age {age} Bags Girls"
-        elif "bags boys" in tail:
-            return f"Age {age} Bags Boys"
-        elif "bags" in tail:
-            return f"Age {age} Bags"
-        else:
-            return f"Age {age}"
-    # Fallback
-    return cap_role
-
 def expand_to_slot_rows(capacity_df: pd.DataFrame, service_dates: List[pd.Timestamp], schedule_cells: Dict[tuple, list]) -> pd.DataFrame:
-    """Return a display table with one row per slot (dates as columns) with labels similar to 'August 2025' template."""
+    """Return a display table with one row per slot (dates as columns)."""
     rows = []
     index_labels = []
     date_cols = [d.strftime('%Y-%m-%d') for d in service_dates]
 
-    # Define ordering similar to template
-    order_keys = []
-    # Leadership block
-    for role in ["Oversight", "Main Director", "Director Roaming Inside", "Director Roaming Outside"]:
-        if role in capacity_df["Role"].values:
-            order_keys.append(role)
-    # Ages 1..11 blocks (leader first, then volunteers & extras)
-    for age in range(1, 12):
-        # leader
-        r = f"Age {age} leader"
-        if r in capacity_df["Role"].str.lower().values:
-            # find exact case role
-            exact = capacity_df["Role"][capacity_df["Role"].str.lower()==r].iloc[0]
-            order_keys.append(exact)
-        # volunteers
-        rv = f"Age {age} volunteers"
-        if rv in capacity_df["Role"].str.lower().values:
-            order_keys.append(capacity_df["Role"][capacity_df["Role"].str.lower()==rv].iloc[0])
-        # nappies/bags
-        for tail in ["nappies", "bags girls", "bags boys", "bags"]:
-            rx = f"Age {age} {tail}"
-            mask = capacity_df["Role"].str.lower()==rx
-            if mask.any():
-                order_keys.append(capacity_df["Role"][mask].iloc[0])
-    # Special needs at end
-    if "Special needs volunteers" in capacity_df["Role"].str.lower().values:
-        order_keys.append(capacity_df["Role"][capacity_df["Role"].str.lower()=="special needs volunteers"].iloc[0])
+    for _, crow in capacity_df.iterrows():
+        cap_role = str(crow['Role']).strip()
+        cap = int(crow['Capacity'])
+        is_volunteers = cap_role.lower().endswith('volunteers')
+        base_label = cap_role[:-10].strip() if is_volunteers else cap_role  # remove 'volunteers'
 
-    # Deduplicate while preserving order, include any remainder
-    seen = set()
-    ordered_roles = []
-    for r in order_keys:
-        if r not in seen:
-            seen.add(r); ordered_roles.append(r)
-    for r in capacity_df["Role"]:
-        if r not in seen:
-            ordered_roles.append(r)
+        # map leader labels to August sheet style
+        if cap_role.endswith('leader'):
+            age_num = ''.join([c for c in cap_role if c.isdigit()])
+            if age_num:
+                n = int(age_num)
+                if n <= 3:
+                    base_label = f"Babies Leader Age {n}"
+                elif n <= 6:
+                    base_label = f"Pre-School Leader Age {n}"
+                elif n <= 8:
+                    base_label = f"Elementary Leader Age {n}"
+                else:
+                    base_label = f"uGroup Age {n}"
 
-    # Build rows
-    for cap_role in ordered_roles:
-        cap = int(capacity_df.loc[capacity_df["Role"] == cap_role, "Capacity"].iloc[0])
+        if cap_role.lower().startswith('special needs'):
+            base_label = "Special Needs"
+
         for slot_idx in range(cap):
             row = {}
             for d in service_dates:
                 names = schedule_cells.get((cap_role, d), [])
                 row[d.strftime('%Y-%m-%d')] = names[slot_idx] if slot_idx < len(names) else ''
             rows.append(row)
-            index_labels.append(_display_label(cap_role, slot_idx))
+            index_labels.append(base_label)
 
     disp = pd.DataFrame(rows, columns=date_cols)
     disp.index = index_labels
-
-    # Make header top row contain dates exactly as in template (dates, not strings) when exporting
-    disp.columns = [pd.to_datetime(c) for c in disp.columns]
-
+    disp.index.name = "Role"
     return disp
-
 
 def build_availability_counts_df(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp]) -> pd.DataFrame:
     """Availability counts for ALL eligible people (priority >=1 on at least one role)."""
@@ -634,43 +579,44 @@ if run_btn:
         st.dataframe(low_avail_df, use_container_width=True)
 
     # ---------- Downloads (no Capacities sheet) ----------
-    def _autofit(worksheet, df, index=True):
-        # Estimate optimal column widths; wrap long text
-        wrap = worksheet.book.add_format({'text_wrap': True})
-        # Determine number of columns including index col if present
-        start_col = 0
-        cols = []
+    def _autofit(workbook, worksheet, df: pd.DataFrame, *, index=True):
+        """Auto-fit column widths and wrap text using xlsxwriter objects."""
+        wrap = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+        # Build list of columns including index (first column) if requested
+        columns = []
         if index:
-            # Pandas writes the index with a blank header
             idx_name = df.index.name if df.index.name else ""
             idx_vals = [str(x) if x is not None else "" for x in df.index.to_list()]
-            cols.append([idx_name] + idx_vals)
+            columns.append([idx_name] + idx_vals)
         for c in df.columns:
             vals = [str(c)] + ["" if pd.isna(v) else str(v) for v in df[c].tolist()]
-            cols.append(vals)
-        for i, col_vals in enumerate(cols):
+            columns.append(vals)
+
+        for i, col_vals in enumerate(columns):
             max_len = max((len(s) for s in col_vals), default=0)
-            width = min(80, max(12, int(max_len * 1.1)))
+            # heuristic width: 1 char ~= 1 unit; clamp to reasonable range
+            width = min(80, max(14, int(max_len * 1.15)))
             worksheet.set_column(i, i, width, wrap)
 
     out_xlsx = io.BytesIO()
     with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
         # Schedule sheet (index=True)
         slot_disp.to_excel(writer, sheet_name="Schedule", index=True)
+        wb = writer.book
         ws = writer.sheets["Schedule"]
-        _autofit(ws, slot_disp, index=True)
+        _autofit(wb, ws, slot_disp, index=True)
 
         # AssignmentSummary sheet (ONLY Person + AssignedCount)
         simple_summary = summary_df[["Person", "AssignedCount"]].copy()
         simple_summary.to_excel(writer, sheet_name="AssignmentSummary", index=False)
         ws2 = writer.sheets["AssignmentSummary"]
-        _autofit(ws2, simple_summary, index=False)
+        _autofit(wb, ws2, simple_summary, index=False)
 
         # LowAvailability sheet
         if not low_avail_df.empty:
             low_avail_df.to_excel(writer, sheet_name="LowAvailability", index=False)
             ws3 = writer.sheets["LowAvailability"]
-            _autofit(ws3, low_avail_df, index=False)
+            _autofit(wb, ws3, low_avail_df, index=False)
 
     out_xlsx.seek(0)
 
