@@ -54,7 +54,6 @@ except FileNotFoundError:
 MOST_PEOPLE_RATIO = 0.80   # if >=80% of people reached 2, allow a 3rd assignment to fill gaps
 RANDOM_SEED = 123          # deterministic tie-breaks
 
-
 # ------------------------------
 # Helpers
 # ------------------------------
@@ -262,7 +261,6 @@ def schedule_with_capacities(long_df: pd.DataFrame,
     # -------- PASS 2 (optional): Allow a 3rd assignment if most people reached 2 --------
     if unfilled and ratio_with_two >= MOST_PEOPLE_RATIO:
         # Try to fill remaining using people at exactly 2 (cap at 3), still no double-booking per date
-        # Recompute "remaining" per (role, date)
         remaining_map = {}
         for (role, d), names in schedule_cells.items():
             cap = int(capacity_df.loc[capacity_df["Role"] == role, "Capacity"].iloc[0])
@@ -297,7 +295,6 @@ def schedule_with_capacities(long_df: pd.DataFrame,
                     candidates.append((p, best_pr))
 
                 while rem > 0 and candidates:
-                    # among equal 2-count people, prefer lower priority number
                     candidates.sort(key=lambda x: (x[1], rng.random()))
                     chosen, pr = candidates[0]
                     schedule_cells[(cap_role, d)].append(chosen)
@@ -325,17 +322,20 @@ def schedule_with_capacities(long_df: pd.DataFrame,
 
     return disp, assign_count, unfilled_df, ratio_with_two
 
+# ------------------------------
+# UI (everything on page)
+# ------------------------------
+st.subheader("1) Upload files (single month only)")
+col1, col2 = st.columns(2)
+with col1:
+    people_file = st.file_uploader("Serving positions (Excel)", type=["xlsx", "xls"], key="people_file")
+with col2:
+    responses_file = st.file_uploader("Form responses (Excel)", type=["xlsx", "xls"], key="responses_file")
 
-# ------------------------------
-# UI (no date/month controls)
-# ------------------------------
-with st.sidebar:
-    st.header("Upload Files (single month only)")
-    people_file = st.file_uploader("Serving positions (Excel)", type=["xlsx", "xls"])
-    responses_file = st.file_uploader("Form responses (Excel)", type=["xlsx", "xls"])
-    st.markdown("Capacities per date (edit if needed):")
-    cap_df = st.data_editor(pd.DataFrame(DEFAULT_CAPACITIES), num_rows="dynamic")
-    run_btn = st.button("Generate Schedule")
+st.subheader("2) Capacities per date")
+cap_df = st.data_editor(pd.DataFrame(DEFAULT_CAPACITIES), num_rows="dynamic", key="cap_table")
+
+run_btn = st.button("Generate Schedule", type="primary")
 
 if run_btn:
     if not people_file or not responses_file:
@@ -373,29 +373,27 @@ if run_btn:
     )
 
     st.success(f"Schedule generated for {date(service_dates[0].year, service_dates[0].month, 1):%B %Y}!")
-    st.write("### Schedule (positions as rows, dates as columns)")
-    st.dataframe(schedule_display)
 
-    # Role mapping diagnostics
-    st.write("### Role Mapping (capacities -> sheet columns)")
+    st.subheader("3) Schedule (positions as rows, dates as columns)")
+    st.dataframe(schedule_display, use_container_width=True)
+
+    st.subheader("Role Mapping (capacities → sheet columns)")
     mapping_rows = []
     for cap_role, mapped in role_map.items():
         mapping_rows.append({"Capacity Role": cap_role, "Matched Sheet Roles": ", ".join(mapped) if mapped else "(no match)"})
-    st.dataframe(pd.DataFrame(mapping_rows))
+    st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
 
-    # Assignment summary
-    st.write("### Assignment Summary")
+    st.subheader("Assignment Summary")
     series = pd.Series(assign_count, name="AssignedCount").sort_values(ascending=False)
     report_df = series.reset_index().rename(columns={"index": "Person"})
-    st.dataframe(report_df)
+    st.dataframe(report_df, use_container_width=True)
 
-    # Coverage note
     st.info(f"{ratio_with_two:.0%} of people reached 2 assignments. "
             f"{'A 3rd-pass fill was applied.' if ratio_with_two >= MOST_PEOPLE_RATIO else 'No 3rd-pass fill applied (threshold 80%).'}")
 
     if not unfilled_df.empty:
-        st.warning("Some slots could not be filled even after the 3rd-pass rule. See below:")
-        st.dataframe(unfilled_df)
+        st.warning("Some slots could not be filled even after the 3rd-pass rule:")
+        st.dataframe(unfilled_df, use_container_width=True)
 
     # Downloads
     out_xlsx = io.BytesIO()
@@ -414,7 +412,8 @@ if run_btn:
     st.download_button("Download CSV (.csv)", data=out_csv.getvalue(), file_name=f"uKids_schedule_{year}_{month:02d}.csv", mime="text/csv")
 
 else:
-    st.info("Upload the two Excel files for a single month and click **Generate Schedule**. ")
+    st.info("Upload the two Excel files for a single month, check capacities, then click **Generate Schedule**. ")
+
 
 
 
