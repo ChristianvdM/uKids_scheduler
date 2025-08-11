@@ -149,7 +149,7 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, year: int
     service_dates = sorted(set(date_map.values()))
     return availability, service_dates
 
-def schedule_exact2(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp], roles:!List[str]):
+def schedule_exact2(long_df: pd.DataFrame, availability: Dict[str, Dict[pd.Timestamp, bool]], service_dates: List[pd.Timestamp], roles: List[str]):
     """
     Greedy two-pass scheduler for EXACTLY 2 per person where feasible:
     - Only assigns to roles with priority>=1
@@ -299,6 +299,8 @@ if run_btn:
     st.write(f'People with = 2 assignments: {len(exact)}')
 else:
     st.info('Upload the two Excel files for a single month and click **Generate Schedule**. This app detects the month automatically from headers like "Are you available 7 September?".')
+
+
 
 
 
