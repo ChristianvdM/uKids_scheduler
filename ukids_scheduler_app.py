@@ -11,6 +11,38 @@ from typing import Dict, List, Tuple
 st.set_page_config(page_title='uKids Scheduler', layout='wide')
 st.title('uKids Children Scheduler')
 
+# Set black theme using custom CSS
+st.markdown(
+    """
+    <style>
+        body {
+            background-color: #000000;
+            color: white;
+        }
+        .stApp {
+            background-color: #000000;
+        }
+        .stButton>button, .stDownloadButton>button {
+            background-color: #444;
+            color: white;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# Load and center the logo
+try:
+    with open("image(1).png", "rb") as img_file:
+        encoded = base64.b64encode(img_file.read()).decode()
+        st.markdown(f"""
+            <div style='text-align: center;'>
+                <img src='data:image/png;base64,{encoded}' width='600'>
+            </div>
+        """, unsafe_allow_html=True)
+except FileNotFoundError:
+    st.warning("Logo image not found. Please upload or place 'image.png' in the app directory.")
+
 # ---------- Helpers ----------
 def detect_name_column(df: pd.DataFrame) -> str:
     # Prefer common name headings; fallback to first column
@@ -226,4 +258,5 @@ if run_btn:
     st.write(f'People with > 2 assignments: {len(over)} (should be 0)')
 else:
     st.info('Upload the two Excel files on the left, set month/year and rule, then click **Generate Schedule**.')
+
 
