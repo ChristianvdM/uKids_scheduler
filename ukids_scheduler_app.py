@@ -1,30 +1,198 @@
-import pandas as pd
-from collections import defaultdict
+# ukids_scheduler_app.py
 
+import io
+import re
+import base64
+from collections import defaultdict, Counter
+from datetime import datetime, date
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Page look & feel
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="uKids Scheduler", layout="wide")
+st.title("uKids Scheduler")
+
+st.markdown(
+    """
+    <style>
+      .stApp { background: #000; color: #fff; }
+      .stButton>button, .stDownloadButton>button { background:#444; color:#fff; }
+      .stDataFrame { background:#111; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Try to show optional logo (ignore if missing)
+for logo_name in ["image(1).png", "image.png", "logo.png"]:
+    try:
+        with open(logo_name, "rb") as img_file:
+            encoded = base64.b64encode(img_file.read()).decode()
+            st.markdown(
+                f"<div style='text-align:center'><img src='data:image/png;base64,{encoded}' width='520'></div>",
+                unsafe_allow_html=True,
+            )
+            break
+    except Exception:
+        pass
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+MONTH_ALIASES = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+YES_SET = {"yes", "y", "true"}
+
+def detect_name_column(df: pd.DataFrame, fallback_first: bool = True) -> str:
+    """Find a name column. Tries common headings, then any column containing 'name'.
+       If not found, optionally falls back to the first column."""
+    candidates = [
+        "What is your name AND surname?",
+        "Name",
+        "Full name",
+        "Full names",
+    ]
+    cols_l = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        key = c.strip().lower()
+        if key in cols_l:
+            return cols_l[key]
+    # fuzzy contains "name"
+    for c in df.columns:
+        if isinstance(c, str) and "name" in c.lower():
+            return c
+    if fallback_first:
+        return df.columns[0]
+    raise ValueError("Could not detect a 'name' column.")
+
+def is_priority_col(series: pd.Series) -> bool:
+    """Priority columns contain numbers 0..5 mainly; we'll treat any numeric-like col as potential role column."""
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if len(vals) == 0:
+        return False
+    return (vals.min() >= 0) and (vals.max() <= 5)
+
+def normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
+def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
+    """Find availability columns like 'Are you available 7 September?' and return year, month, and mapping."""
+    avail_cols = [c for c in responses_df.columns if isinstance(c, str) and c.strip().lower().startswith("are you available")]
+    if not avail_cols:
+        # also accept headers that look like dates only, e.g., '7 September'
+        avail_cols = [c for c in responses_df.columns if isinstance(c, str) and re.search(r"\b\d{1,2}\b", c.lower()) and any(m in c.lower() for m in MONTH_ALIASES)]
+    if not avail_cols:
+        raise ValueError("No availability columns found. Expect headings like 'Are you available 7 September?'")
+
+    info = []
+    for c in avail_cols:
+        low = c.lower()
+        # find month
+        mname = None
+        for alias in MONTH_ALIASES:
+            if alias in low:
+                mname = alias
+                break
+        day_m = re.search(r"\b(\d{1,2})\b", low)
+        if mname and day_m:
+            info.append((c, MONTH_ALIASES[mname], int(day_m.group(1))))
+    if not info:
+        raise ValueError("Could not parse day/month from availability headers.")
+
+    months = {m for _, m, _ in info}
+    if len(months) > 1:
+        raise ValueError(f"Multiple months detected in availability headers: {sorted(months)}. Upload one month at a time.")
+    month = months.pop()
+
+    # Year: infer from 'Timestamp' if present; else current year
+    if "Timestamp" in responses_df.columns:
+        years = pd.to_datetime(responses_df["Timestamp"], errors="coerce").dt.year.dropna().astype(int)
+        year = int(years.mode().iloc[0]) if not years.empty else date.today().year
+    else:
+        year = date.today().year
+
+    date_map = {c: pd.Timestamp(datetime(year, month, d)).normalize() for c, _, d in info}
+    service_dates = sorted(set(date_map.values()))
+    # also return a readable sheet name
+    sheet_name = f"{pd.Timestamp(year=year, month=month, day=1):%B %Y}"
+    return year, month, date_map, service_dates, sheet_name
+
+def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols):
+    """Build long format eligibility (priority>=1 => eligible, 0 => ineligible)."""
+    records = []
+    for _, r in people_df.iterrows():
+        person = str(r[name_col]).strip()
+        if not person or person.lower() == "nan":
+            continue
+        for role in role_cols:
+            pr = pd.to_numeric(r[role], errors="coerce")
+            if pd.isna(pr):
+                continue
+            pr = int(round(pr))
+            if pr >= 1:  # 0 means not an option
+                records.append({"person": person, "role": role, "priority": pr})
+    return pd.DataFrame(records)
+
+def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map):
+    """Build availability dict[name][date] -> bool, and list of people with <2 'Yes' dates."""
+    availability = {}
+    yes_counts = Counter()
+    for _, row in responses_df.iterrows():
+        nm = str(row.get(name_col_resp, "")).strip()
+        if not nm or nm.lower() == "nan":
+            continue
+        availability.setdefault(nm, {})
+        for col, dt in date_map.items():
+            ans = str(row.get(col, "")).strip().lower()
+            is_yes = ans in YES_SET
+            availability[nm][dt] = is_yes
+            if is_yes:
+                yes_counts[nm] += 1
+    few_yes = sorted([n for n, c in yes_counts.items() if c < 2])
+    service_dates = sorted(set(date_map.values()))
+    return availability, service_dates, few_yes
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Slot plan (each slot = a row)
+# ──────────────────────────────────────────────────────────────────────────────
 def build_slot_plan():
-    """
-    Define how many ROWS (independent slots) each position gets.
-    Keys should match your column names in the positions sheet.
-    Leaders are included here (1 row each).
-    """
+    """Exact capacities per your instructions (leaders included)."""
     slot_plan = {
         # Age 1
         "Age 1 leader": 1,
-        "Age 1 classroom": 5,        # volunteers (5)
+        "Age 1 classroom": 5,        # 5 volunteers
         "Age 1 nappies": 1,
         "Age 1 bags girls": 1,
         "Age 1 bags boys": 1,
 
         # Age 2
         "Age 2 leader": 1,
-        "Age 2 classroom": 4,        # volunteers (4)
+        "Age 2 classroom": 4,        # 4 volunteers
         "Age 2 nappies": 1,
         "Age 2 bags girls": 1,
         "Age 2 bags boys": 1,
 
         # Age 3
         "Age 3 leader": 1,
-        "Age 3 classroom": 4,        # volunteers (4)
+        "Age 3 classroom": 4,
         "Age 3 bags": 1,
 
         # Age 4
@@ -47,10 +215,10 @@ def build_slot_plan():
         "Age 8 leader": 1,
         "Age 8 classroom": 2,
 
-        # Age 9 (you listed “1 age 9 volunteers” twice; we’ll model as two separate 1‑slot rows)
+        # Age 9 (you listed volunteers twice; model as two separate one-person rows)
         "Age 9 leader": 1,
-        "Age 9 classroom A": 1,      # volunteers (1)
-        "Age 9 classroom B": 1,      # volunteers (1)
+        "Age 9 classroom A": 1,
+        "Age 9 classroom B": 1,
 
         # Age 10
         "Age 10 leader": 1,
@@ -62,77 +230,55 @@ def build_slot_plan():
 
         # Special Needs
         "Special needs leader": 1,
-        "Special needs classroom": 2,  # volunteers (2)
+        "Special needs classroom": 2,
     }
     return slot_plan
 
 def expand_roles_to_slots(slot_plan):
-    """
-    Expand role names to concrete slot row labels.
-    E.g. "Age 1 classroom": 5 -> ["Age 1 classroom #1", ..., "#5"]
-    Single-slot roles keep their base name (no #1 suffix).
-    """
+    """Expand into concrete slot row labels."""
     slot_rows = []
-    slot_index = {}  # map slot row label -> base role name
+    slot_index = {}
     for role, n in slot_plan.items():
         if n <= 0:
             continue
         if n == 1:
-            label = role
-            slot_rows.append(label)
-            slot_index[label] = role
+            lab = role
+            slot_rows.append(lab)
+            slot_index[lab] = role
         else:
-            for i in range(1, n+1):
-                label = f"{role} #{i}"
-                slot_rows.append(label)
-                slot_index[label] = role
+            for i in range(1, n + 1):
+                lab = f"{role} #{i}"
+                slot_rows.append(lab)
+                slot_index[lab] = role
     return slot_rows, slot_index
 
-def build_eligibility(long_df):
-    """
-    Convert long_df (person, role, priority) to:
-    eligibility[person] = set of role names they can do (priority >=1)
-    NB: priority==0 means NOT eligible.
-    """
+def build_eligibility(long_df: pd.DataFrame):
+    """eligibility[person] = set of exact role names they can do (priority>=1)."""
     elig = defaultdict(set)
     for _, r in long_df.iterrows():
-        person = str(r["person"]).strip()
-        role = str(r["role"]).strip()
-        pr = int(r["priority"])
-        if pr >= 1:        # 0 is “not an option”
-            elig[person].add(role)
+        elig[str(r["person"]).strip()].add(str(r["role"]).strip())
     return elig
 
 def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_person=2):
-    """
-    Core scheduler:
-    - Every slot row is an independent 1-person position per date
-    - Ignores preference ordering (except priority 0 = ineligible)
-    - Caps each person at 2 assignments total across the month
-    - Tries to fill *everything* greedily date-by-date, slot-by-slot
-    - If a slot’s base role is not found in a person’s eligible roles, they’re skipped
-    """
+    """Greedy fill to maximize fills, ignoring nonzero priority levels (only 0 blocks)."""
     slot_plan = build_slot_plan()
     slot_rows, slot_to_role = expand_roles_to_slots(slot_plan)
     eligibility = build_eligibility(long_df)
 
-    # Count assignments per person (to enforce max 2)
-    assign_count = defaultdict(int)
-
-    # Initialize output structure: dict[(slot_row, date)] = assigned_name or ""
-    grid = {(slot, d): "" for slot in slot_rows for d in service_dates}
-
-    # Precompute available people list (intersection of availability and eligibility existance)
+    # Intersection: only people present in both structures
     people = sorted(set(eligibility.keys()) & set(availability.keys()))
 
-    # For fairness, we’ll always pick the person with the lowest total assigned so far,
-    # and avoid double-booking on the same date.
+    # Output grid & counters
+    grid = {(slot, d): "" for slot in slot_rows for d in service_dates}
+    assign_count = defaultdict(int)
+
+    # Greedy: for each date, for each slot row, take the available eligible person with the fewest total assignments
     for d in service_dates:
         assigned_today = set()
         for slot_row in slot_rows:
             base_role = slot_to_role[slot_row]
 
-            # Gather candidates
+            # gather candidates
             cands = []
             for p in people:
                 if assign_count[p] >= max_assignments_per_person:
@@ -141,44 +287,182 @@ def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_
                     continue
                 if not availability.get(p, {}).get(d, False):
                     continue
-                # Person must be eligible for the *base role* (match by startswith to handle classroom/bags/lists)
-                # We allow some flexible matching: exact, or if any eligible role
-                # in sheet contains the base role tokens (helps with “classroom” vs “volunteers” wording).
+
+                # exact match or normalized exact
                 elig_roles = eligibility.get(p, set())
                 ok = False
                 if base_role in elig_roles:
                     ok = True
                 else:
-                    # try forgiving match (normalize both)
-                    def norm(s): return "".join(ch.lower() for ch in s if ch.isalnum() or ch.isspace()).strip()
-                    nb = norm(base_role)
+                    nb = normalize(base_role)
                     for er in elig_roles:
-                        if norm(er) == nb:
+                        if normalize(er) == nb:
                             ok = True
                             break
                 if ok:
                     cands.append(p)
 
-            # pick the candidate with the fewest total assignments so far (greedy fill-first)
             if cands:
                 cands.sort(key=lambda name: assign_count[name])
                 chosen = cands[0]
                 grid[(slot_row, d)] = chosen
                 assign_count[chosen] += 1
                 assigned_today.add(chosen)
-            # else it stays "" (unfilled)
+            # else remains empty ""
 
-    # Build DataFrame: rows = slot rows, columns = dates (YYYY-MM-DD)
+    # Build DataFrame
     cols = [d.strftime("%Y-%m-%d") for d in service_dates]
-    out = pd.DataFrame(index=slot_rows, columns=cols)
+    schedule_df = pd.DataFrame(index=slot_rows, columns=cols)
     for (slot_row, d), name in grid.items():
-        out.loc[slot_row, d.strftime("%Y-%m-%d")] = name
+        schedule_df.loc[slot_row, d.strftime("%Y-%m-%d")] = name
+    schedule_df = schedule_df.fillna("")
+    return schedule_df, dict(assign_count)
 
-    # Fill NaNs with ""
-    out = out.fillna("")
-    return out, dict(assign_count)
+def excel_autofit(ws):
+    """Autofit columns based on max text length in each column."""
+    for col_idx, column_cells in enumerate(ws.iter_cols(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column), start=1):
+        max_len = 0
+        for cell in column_cells:
+            val = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
-# ── Example wiring inside your app after you have long_df, availability, service_dates ──
-# schedule_df, assign_count = schedule_by_slots(long_df, availability, service_dates)
-# st.dataframe(schedule_df, use_container_width=True)
-# …then write schedule_df to Excel like you already do.
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.subheader("1) Upload files (CSV)")
+
+c1, c2 = st.columns(2)
+with c1:
+    positions_file = st.file_uploader("Serving positions (CSV)", type=["csv"], key="positions_csv")
+with c2:
+    responses_file = st.file_uploader("Availability responses (CSV)", type=["csv"], key="responses_csv")
+
+st.caption("• Positions CSV: first column must be volunteer names, remaining columns are role headings with values 0‑5 (0 = not eligible).")
+st.caption("• Responses CSV: must include a name column (e.g., 'What is your name AND surname?') and availability columns like 'Are you available 7 September?'.")
+
+run_btn = st.button("Generate Schedule", type="primary")
+
+if run_btn:
+    if not positions_file or not responses_file:
+        st.error("Please upload both CSV files.")
+        st.stop()
+
+    # Read CSVs (allow any delimiter style; fall back to default if sniffer fails)
+    try:
+        positions_df = pd.read_csv(positions_file)
+    except Exception:
+        positions_df = pd.read_csv(positions_file, sep=",")
+
+    try:
+        responses_df = pd.read_csv(responses_file)
+    except Exception:
+        responses_df = pd.read_csv(responses_file, sep=",")
+
+    # Detect name columns
+    try:
+        name_col_positions = detect_name_column(positions_df, fallback_first=True)
+    except Exception as e:
+        st.error(f"Could not detect a name column in positions CSV: {e}")
+        st.stop()
+
+    try:
+        name_col_responses = detect_name_column(responses_df, fallback_first=False)
+    except Exception as e:
+        st.error(f"Could not detect a name column in responses CSV: {e}")
+        st.stop()
+
+    # Role columns = all columns except the name column that look like priorities
+    role_cols = [c for c in positions_df.columns if c != name_col_positions and is_priority_col(positions_df[c])]
+    if not role_cols:
+        st.error("No role columns with priorities (0..5) detected in the positions CSV.")
+        st.stop()
+
+    # Build eligibility (priority>=1)
+    long_df = build_long_df(positions_df, name_col_positions, role_cols)
+    if long_df.empty:
+        st.error("No eligible assignments found (all priorities are 0 or missing).")
+        st.stop()
+
+    # Parse month/dates & availability
+    try:
+        year, month, date_map, service_dates, sheet_name = parse_month_and_dates_from_headers(responses_df)
+    except Exception as e:
+        st.error(f"Could not parse month & dates from responses: {e}")
+        st.stop()
+
+    availability, service_dates, few_yes_list = parse_availability(responses_df, name_col_responses, date_map)
+
+    # Remove people not in both datasets (intersection happens implicitly in scheduler, but we’ll report)
+    elig_people = set(long_df["person"].unique())
+    avail_people = set(availability.keys())
+    both_people = elig_people & avail_people
+
+    # Build schedule
+    schedule_df, assign_count = schedule_by_slots(long_df, availability, service_dates, max_assignments_per_person=2)
+
+    # ── Stats
+    total_slots = schedule_df.size
+    filled_slots = int((schedule_df != "").sum().sum())
+    fill_rate = (filled_slots / total_slots) if total_slots else 0.0
+    unfilled = total_slots - filled_slots
+    # per-person summary
+    per_person = pd.Series(assign_count, name="Assignments").sort_values(ascending=False).reset_index().rename(columns={"index":"Person"})
+
+    st.success(f"Schedule generated for **{sheet_name}**")
+    st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
+    st.dataframe(schedule_df, use_container_width=True)
+
+    st.subheader("Assignment Summary")
+    st.dataframe(per_person, use_container_width=True)
+
+    st.subheader("People with < 2 'Yes' dates (excluded list)")
+    few_yes_df = pd.DataFrame({"Person": few_yes_list})
+    st.dataframe(few_yes_df, use_container_width=True)
+
+    # ── Build Excel for download
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    # Write header row (dates)
+    header = ["Position / Slot"] + [d.strftime("%Y-%m-%d") for d in service_dates]
+    ws.append(header)
+
+    # Write rows
+    for idx, row_name in enumerate(schedule_df.index, start=2):
+        row_vals = [row_name] + [schedule_df.iloc[idx-2, j] for j in range(len(service_dates))]
+        ws.append(row_vals)
+
+    # Autofit columns
+    excel_autofit(ws)
+
+    # Add sheet for <2 Yes
+    if few_yes_list:
+        ws2 = wb.create_sheet("Less than 2 available")
+        ws2.append(["Person"])
+        for p in few_yes_list:
+            ws2.append([p])
+        excel_autofit(ws2)
+
+    # Add sheet for per-person counts
+    ws3 = wb.create_sheet("Assignment Summary")
+    ws3.append(["Person", "Assignments"])
+    for _, r in per_person.iterrows():
+        ws3.append([r["Person"], int(r["Assignments"])])
+    excel_autofit(ws3)
+
+    # Save to buffer
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    st.download_button(
+        "Download Excel (.xlsx)",
+        data=buf,
+        file_name=f"uKids_schedule_{sheet_name.replace(' ','_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+else:
+    st.info("Upload the two CSV files (positions + availability) and click **Generate Schedule**.")
