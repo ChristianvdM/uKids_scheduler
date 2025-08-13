@@ -1,89 +1,128 @@
 import pandas as pd
-import numpy as np
-from collections import defaultdict, Counter
+import streamlit as st
+from io import StringIO
 from openpyxl import Workbook
+from datetime import datetime
+import base64
 
-# Load CSV inputs
-availability_df = pd.read_csv("Untitled form (Responses) - Form Responses 1.csv")
-positions_df = pd.read_csv("uKids serving positions.xlsx - Pretoria.csv")
+st.set_page_config(layout="wide")
+st.title("uKids September Scheduler")
 
-# Standardize column headers
-availability_df.columns = availability_df.columns.str.strip()
-positions_df.columns = positions_df.columns.str.strip()
+# Upload CSV files
+availability_file = st.file_uploader("Upload availability CSV", type="csv", key="avail")
+positions_file = st.file_uploader("Upload serving positions CSV", type="csv", key="roles")
 
-# Extract dates from availability columns
-date_cols = [col for col in availability_df.columns if col.startswith("Are you available")]
-service_dates = [col.split("Are you available")[-1].strip(" ?") for col in date_cols]
+if not availability_file or not positions_file:
+    st.warning("Please upload both availability and serving positions CSV files.")
+    st.stop()
 
-# Map names to availability by date
-availability = defaultdict(dict)
+# Read files
+availability_df = pd.read_csv(availability_file)
+positions_df = pd.read_csv(positions_file)
+
+# Extract service dates
+service_dates = [col for col in availability_df.columns if "September" in col]
+
+# Standardize names
+availability_df["Name"] = availability_df.iloc[:, 1].str.strip()
+
+# Convert availability to dict
+availability = {}
 for _, row in availability_df.iterrows():
-    name = row["What is your name AND surname?"].strip()
-    for col in date_cols:
-        date = col.split("Are you available")[-1].strip(" ?")
-        availability[name][date] = str(row[col]).strip().lower() == "yes"
+    name = row["Name"]
+    availability[name] = {}
+    for date in service_dates:
+        availability[name][date] = str(row[date]).strip().lower() == "yes"
 
-# Map eligibility per person per role (remove 0's)
-eligibility = defaultdict(dict)
+# Parse positions/preferences
+positions = []
+eligibility = {}
 for _, row in positions_df.iterrows():
-    name = row.iloc[0].strip()
-    for role, val in row.iloc[1:].items():
+    person = row["Name"].strip()
+    if person not in availability:
+        continue
+    eligibility[person] = {}
+    for role in positions_df.columns[1:]:
         try:
-            score = int(val)
-            if score > 0:
-                eligibility[name][role.strip()] = score
+            pr = int(row[role])
         except:
+            pr = 5
+        eligibility[person][role] = pr
+        if role not in positions:
+            positions.append(role)
+
+# Count of assignments
+count = {name: 0 for name in availability}
+assignments = {(date, role): [] for date in service_dates for role in positions}
+
+# Capacity rules
+capacity = {
+    "Age 3 leader": 1,
+    "Age 3 volunteers": 2,
+    "Age 4 leader": 1,
+    "Age 4 volunteers": 2,
+    "Age 5 leader": 1,
+    "Age 5 volunteers": 2,
+    "Grade R leader": 1,
+    "Grade R volunteers": 2,
+    "Grade 1 leader": 1,
+    "Grade 1 volunteers": 2,
+    "Age 6-8 worship": 2,
+    "Grade 2-3 leader": 1,
+    "Grade 2-3 volunteers": 2,
+    "Grade 4-5 leader": 1,
+    "Grade 4-5 volunteers": 2,
+    "Age 11 leader": 1,
+    "Age 11 volunteers": 2,
+    "Special needs volunteers": 2,
+}
+
+# Assign roles
+for date in service_dates:
+    for role in positions:
+        if role not in capacity:
             continue
-
-# Build long dataframe of eligible people for each role
-data = []
-for person, roles in eligibility.items():
-    for role, score in roles.items():
-        data.append({"person": person, "role": role, "priority": score})
-long_df = pd.DataFrame(data)
-
-# Get full unique list of roles
-roles = sorted(long_df['role'].unique())
-
-# Assignments per date, per role
-assignments = defaultdict(lambda: defaultdict(str))
-assignment_counts = Counter()
-
-# Calculate capacity: assume 1 per role by default, can customize if needed
-role_capacity = {role: 1 for role in roles}
-
-# Max 2 assignments per person
-max_assignments = 2
-
-for date in service_dates:
-    for role in roles:
+        needed = capacity[role]
+        possible = [p for p in eligibility if availability[p].get(date, False)
+                    and role in eligibility[p]
+                    and eligibility[p][role] > 0
+                    and count[p] < 2
+                    and len(assignments[(date, role)]) < needed]
         assigned = 0
-        candidates = [p for p in long_df[long_df['role'] == role]['person'].unique()
-                      if availability[p].get(date, False)
-                      and assignment_counts[p] < max_assignments]
-        np.random.shuffle(candidates)  # randomness to distribute load
-        for person in candidates:
-            if assigned >= role_capacity[role]:
+        for p in sorted(possible, key=lambda x: (count[x])):
+            if assigned >= needed:
                 break
-            if person not in assignments[date].values():
-                assignments[date][role] = person
-                assignment_counts[person] += 1
-                assigned += 1
+            assignments[(date, role)].append(p)
+            count[p] += 1
+            assigned += 1
 
-# Build schedule DataFrame
-schedule_df = pd.DataFrame(index=roles, columns=service_dates)
+# Output DataFrame
+schedule = pd.DataFrame(index=positions, columns=service_dates)
 for date in service_dates:
-    for role in roles:
-        schedule_df.loc[role, date] = assignments[date].get(role, "")
+    for role in positions:
+        people = assignments.get((date, role), [])
+        schedule.at[role, date] = ", ".join(people)
 
-# Build stats sheet
-stats_df = pd.DataFrame.from_dict(assignment_counts, orient='index', columns=['Assignments'])
-stats_df = stats_df.sort_values(by="Assignments", ascending=False)
+# Display
+st.dataframe(schedule.fillna(""))
 
-# Save to Excel
-out_path = "uKids_September_Schedule.xlsx"
-with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+# Stats
+st.markdown("### Summary Statistics")
+assigned_df = pd.DataFrame.from_dict(count, orient="index", columns=["Times Assigned"])
+st.dataframe(assigned_df.sort_values("Times Assigned", ascending=False))
+
+# Export
+def to_excel(schedule_df):
+    output = StringIO()
+    writer = pd.ExcelWriter("schedule_output.xlsx", engine='openpyxl')
     schedule_df.to_excel(writer, sheet_name="Schedule")
-    stats_df.to_excel(writer, sheet_name="Stats")
+    assigned_df.to_excel(writer, sheet_name="Stats")
+    writer.close()
+    return "schedule_output.xlsx"
 
-print(f"✅ Schedule saved to {out_path}")
+if st.button("📥 Download Schedule"):
+    filename = to_excel(schedule)
+    with open(filename, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    href = f'<a href="data:application/octet-stream;base64,{b64}" download="schedule_output.xlsx">Click here to download your schedule</a>'
+    st.markdown(href, unsafe_allow_html=True)
