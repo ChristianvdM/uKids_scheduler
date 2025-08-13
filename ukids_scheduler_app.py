@@ -2,11 +2,11 @@
 # Robust CSV loader + slot-per-row scheduler
 # - Accepts ANY CSV filenames for positions & availability
 # - Tries multiple encodings (utf-8, utf-8-sig, cp1252, iso-8859-1)
-# - Tries sniffed separators (engine='python', sep=None), then ',', ';', '\t'
+# - Tries sniffed separators (engine='python', sep=None), then ',', ';', '\t', '|'
 # - Each slot is its own row (leaders included)
 # - Ignores priorities except 0 (0 = not eligible)
 # - Max 2 assignments per person across the whole month
-# - People with <2 "Yes" dates go to a separate sheet
+# - People with <2 "Yes" dates are shown on a separate sheet **for reference only** (NOT excluded)
 # - Output sheet is named like "September 2025"
 # - Columns auto-fit widths in Excel
 
@@ -82,7 +82,6 @@ def read_csv_robust(uploaded_file, label_for_error):
     for enc in encodings:
         for sep in seps:
             try:
-                # engine='python' allows sep=None sniffing
                 df = pd.read_csv(io.BytesIO(raw), encoding=enc, engine="python", sep=sep)
                 if df.shape[1] == 0:
                     raise ValueError("Parsed 0 columns.")
@@ -280,7 +279,7 @@ def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_
     slot_rows, slot_to_role = expand_roles_to_slots(slot_plan)
     eligibility = build_eligibility(long_df)
 
-    # Intersection: only people present in both
+    # Only schedule people that exist in both sources
     people = sorted(set(eligibility.keys()) & set(availability.keys()))
 
     grid = {(slot, d): "" for slot in slot_rows for d in service_dates}
@@ -299,7 +298,7 @@ def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_
                     continue
                 if not availability.get(p, {}).get(d, False):
                     continue
-                # exact match or normalized
+                # exact or normalized match
                 elig_roles = eligibility.get(p, set())
                 ok = False
                 if base_role in elig_roles:
@@ -314,12 +313,13 @@ def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_
                     cands.append(p)
 
             if cands:
-                cands.sort(key=lambda name: assign_count[name])  # fewest used first
+                # Prioritize least-used volunteers first
+                cands.sort(key=lambda name: assign_count[name])
                 chosen = cands[0]
                 grid[(slot_row, d)] = chosen
                 assign_count[chosen] += 1
                 assigned_today.add(chosen)
-            # else stays empty
+            # else: leave empty if no eligible/available person
 
     cols = [d.strftime("%Y-%m-%d") for d in service_dates]
     schedule_df = pd.DataFrame(index=slot_rows, columns=cols)
@@ -349,8 +349,8 @@ with c1:
 with c2:
     responses_file = st.file_uploader("Availability responses (CSV)", type=["csv"], key="responses_csv_any")
 
-st.caption("• Positions CSV: first column should be volunteer names; other columns are role headings with values 0‑5 (0 = not eligible).")
-st.caption("• Responses CSV: must include a name column (e.g., 'What is your name AND surname?') and availability columns like 'Are you available 7 September?'.")
+st.caption("• Positions CSV: first column = volunteer names; other columns are role headings with values 0‑5 (0 = not eligible).")
+st.caption("• Responses CSV: includes a name column (e.g., 'What is your name AND surname?') and columns like 'Are you available 7 September?'.")
 
 if st.button("Generate Schedule", type="primary"):
     if not positions_file or not responses_file:
@@ -396,10 +396,10 @@ if st.button("Generate Schedule", type="primary"):
         st.error(f"Could not parse month & dates from responses: {e}")
         st.stop()
 
-    # Availability & few-Yes list
+    # Availability & <2-Yes list (INFO ONLY — not excluded)
     availability, service_dates, few_yes_list = parse_availability(responses_df, name_col_responses, date_map)
 
-    # Build schedule
+    # Build schedule (no exclusions for one-Yes people)
     schedule_df, assign_count = schedule_by_slots(
         long_df, availability, service_dates, max_assignments_per_person=2
     )
@@ -413,13 +413,14 @@ if st.button("Generate Schedule", type="primary"):
 
     st.success(f"Schedule generated for **{sheet_name}**")
     st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
+
     st.subheader("Schedule (each slot is its own row)")
     st.dataframe(schedule_df, use_container_width=True)
 
     st.subheader("Assignment Summary")
     st.dataframe(per_person, use_container_width=True)
 
-    st.subheader("People with < 2 'Yes' dates (excluded list)")
+    st.subheader("People with < 2 'Yes' dates (for reference only)")
     few_yes_df = pd.DataFrame({"Person": few_yes_list})
     st.dataframe(few_yes_df, use_container_width=True)
 
@@ -436,7 +437,7 @@ if st.button("Generate Schedule", type="primary"):
     excel_autofit(ws)
 
     if few_yes_list:
-        ws2 = wb.create_sheet("Less than 2 available")
+        ws2 = wb.create_sheet("Fewer than 2 Yes (info)")
         ws2.append(["Person"])
         for p in few_yes_list:
             ws2.append([p])
