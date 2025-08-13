@@ -1,113 +1,128 @@
-import streamlit as st
 import pandas as pd
-import datetime
 from collections import defaultdict
-from io import BytesIO
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
-st.set_page_config(layout="wide")
-st.title("🗓️ uKids Scheduler – September 2025")
+# === Configurable section ===
 
-# --- File Upload ---
-availability_file = st.file_uploader("Upload availability CSV", type=["csv"])
-positions_file = st.file_uploader("Upload positions CSV", type=["csv"])
+# Role capacities (excluding leaders)
+role_capacity = {
+    'age 1 volunteers': 5,
+    'age 1 nappies': 1,
+    'age 1 bags girls': 1,
+    'age 1 bags boys': 1,
+    'age 2 volunteers': 4,
+    'age 2 nappies': 1,
+    'age 2 bags girls': 1,
+    'age 2 bags boys': 1,
+    'age 3 volunteers': 4,
+    'age 3 bags': 1,
+    'age 4 volunteers': 4,
+    'age 5 volunteers': 3,
+    'age 6 volunteers': 3,
+    'age 7 volunteers': 2,
+    'age 8 volunteers': 2,
+    'age 9 volunteers': 2,  # x2 as specified
+    'age 10 volunteers': 1,
+    'age 11 volunteers': 1,
+    'special needs volunteers': 2,
+    'leaders': 1
+}
 
-if availability_file and positions_file:
-    availability_df = pd.read_csv(availability_file)
-    positions_df = pd.read_csv(positions_file)
+max_assignments = 2
 
-    # --- Normalize Names and Dates ---
-    name_col = "What is your name AND surname?"
-    date_cols = [col for col in availability_df.columns if "September" in col or "7 September" in col]
+# === Load data ===
 
-    service_dates = []
-    for col in date_cols:
+availability_df = pd.read_csv("Untitled form (Responses).csv")
+positions_df = pd.read_csv("uKids serving positions (4).csv")
+
+# === Clean and parse ===
+
+# Standardize volunteer names
+availability_df.iloc[:, 0] = availability_df.iloc[:, 0].astype(str).str.strip()
+positions_df.iloc[:, 0] = positions_df.iloc[:, 0].astype(str).str.strip()
+
+# Extract dates from columns
+date_columns = availability_df.columns[1:]
+
+# Convert availability to a dict of dicts: availability[name][date] = True/False
+availability = {}
+for _, row in availability_df.iterrows():
+    name = row.iloc[0]
+    availability[name] = {
+        date: str(row[date]).strip().lower() == "yes"
+        for date in date_columns
+    }
+
+# Convert positions to a nested dict: eligibility[name][role] = skill level
+eligibility = {}
+for _, row in positions_df.iterrows():
+    name = row.iloc[0]
+    if name not in availability:
+        continue  # skip if not in both files
+    eligibility[name] = {}
+    for role, value in row.iloc[1:].items():
         try:
-            day = int(col.split()[2])
-            date = datetime.date(2025, 9, day)
-            service_dates.append((col, date))
-        except Exception:
-            continue
+            level = int(value)
+        except:
+            level = 0
+        eligibility[name][role.strip()] = level
 
-    # --- Build Availability Dictionary ---
-    availability = {}
-    for _, row in availability_df.iterrows():
-        name = str(row[name_col]).strip()
-        availability[name] = {}
-        for col, date in service_dates:
-            availability[name][date] = str(row[col]).strip().lower() == "yes"
+# === Build assignment ===
 
-    # --- Build Eligibility Dictionary ---
-    eligibility = defaultdict(dict)
-    roles = set()
-    for _, row in positions_df.iterrows():
-        person = str(row["Name"]).strip()
-        role = str(row["Role"]).strip()
-        level = int(row["Level"])
-        if level > 0:
-            eligibility[person][role] = level
-            roles.add(role)
+assignments = defaultdict(list)  # (date, role) -> list of names
+assignment_count = defaultdict(int)
 
-    # --- Prepare Assignments ---
-    assignments = defaultdict(list)
-    count = defaultdict(int)
+for date in date_columns:
+    for role, needed in role_capacity.items():
+        # Get eligible people
+        possible = [
+            p for p in eligibility
+            if availability[p].get(date, False)
+            and role in eligibility[p]
+            and eligibility[p][role] > 0
+            and assignment_count[p] < max_assignments
+            and p not in assignments[(date, role)]
+        ]
+        assigned = 0
+        for p in sorted(possible, key=lambda x: assignment_count[x]):
+            if assigned >= needed:
+                break
+            assignments[(date, role)].append(p)
+            assignment_count[p] += 1
+            assigned += 1
 
-    for date_label, date in service_dates:
-        for role in roles:
-            needed = int(positions_df[(positions_df["Role"] == role)]["Capacity"].max())
-            possible = [
-                p for p in eligibility
-                if availability.get(p, {}).get(date, False)
-                and role in eligibility[p]
-                and count[p] < 2
-                and len(assignments[(date, role)]) < needed
-            ]
+# === Write Excel ===
 
-            assigned = 0
-            for p in sorted(possible, key=lambda x: count[x]):
-                if assigned >= needed:
-                    break
-                assignments[(date, role)].append(p)
-                count[p] += 1
-                assigned += 1
+wb = Workbook()
+ws = wb.active
+ws.title = "September 2025"
 
-    # --- Format for Excel ---
-    excel_output = BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "September 2025"
+# Create schedule layout
+dates = list(date_columns)
+roles = list(role_capacity.keys())
 
-    sorted_roles = sorted(list(roles))
-    sorted_dates = sorted([date for _, date in service_dates])
+# Headers
+for col, date in enumerate(dates, start=2):
+    ws.cell(row=1, column=col, value=date)
 
-    # Headers
-    ws.cell(row=1, column=1).value = "Role"
-    for j, date in enumerate(sorted_dates):
-        ws.cell(row=1, column=j + 2).value = date.strftime("%-d %b")
+for row, role in enumerate(roles, start=2):
+    ws.cell(row=row, column=1, value=role)
 
-    # Data
-    for i, role in enumerate(sorted_roles):
-        ws.cell(row=i + 2, column=1).value = role
-        for j, date in enumerate(sorted_dates):
-            people = assignments.get((date, role), [])
-            ws.cell(row=i + 2, column=j + 2).value = ", ".join(people)
+# Fill assignments
+for row, role in enumerate(roles, start=2):
+    for col, date in enumerate(dates, start=2):
+        key = (date, role)
+        people = assignments.get(key, [])
+        ws.cell(row=row, column=col, value=", ".join(people))
 
-    # Stats sheet
-    stats_ws = wb.create_sheet("Stats")
-    stats_ws.cell(row=1, column=1).value = "Name"
-    stats_ws.cell(row=1, column=2).value = "Assignments"
-    for i, (name, cnt) in enumerate(sorted(count.items(), key=lambda x: -x[1]), start=2):
-        stats_ws.cell(row=i, column=1).value = name
-        stats_ws.cell(row=i, column=2).value = cnt
+# Add stats sheet
+ws2 = wb.create_sheet("Assignment Count")
+ws2.append(["Name", "Assigned"])
+for name, count in sorted(assignment_count.items(), key=lambda x: x[1], reverse=True):
+    ws2.append([name, count])
 
-    wb.save(excel_output)
-    excel_output.seek(0)
-
-    # --- Download Link ---
-    st.success("✅ Schedule generated!")
-    st.download_button(
-        label="📥 Download Schedule (Excel)",
-        data=excel_output,
-        file_name="ukids_schedule_september_2025.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+# Save output
+output_path = "/mnt/data/ukids_september_schedule_cleaned.xlsx"
+wb.save(output_path)
+print(f"✅ Schedule saved to {output_path}")
