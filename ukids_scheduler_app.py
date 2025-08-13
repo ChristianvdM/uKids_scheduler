@@ -1,165 +1,119 @@
-
-# ukids_scheduler_app.py
-# Streamlit app for uKids Scheduling
-import io
-import pandas as pd
-import numpy as np
 import streamlit as st
-from datetime import datetime
-from typing import Dict, List, Tuple
-import base64
-import re
-from io import BytesIO
+import pandas as pd
 from collections import defaultdict
 
-st.set_page_config(page_title='uKids Scheduler', layout='wide')
-st.title('uKids Scheduler')
+st.set_page_config(layout="wide", page_title="uKids Scheduler")
+st.title("📅 uKids Schedule Generator")
 
-# Logo
-try:
-    with open("image(1).png", "rb") as img_file:
-        encoded = base64.b64encode(img_file.read()).decode()
-        st.markdown(f"""
-            <div style='text-align: center;'>
-                <img src='data:image/png;base64,{encoded}' width='600'>
-            </div>
-        """, unsafe_allow_html=True)
-except:
-    st.warning("Logo not found")
+st.markdown("Upload the two required files: availability (form) and serving positions.")
 
-# Constants
-MONTH_ALIASES = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
-    "may": 5, "jun": 6, "jul": 7, "aug": 8,
-    "sep": 9, "oct": 10, "nov": 11, "dec": 12
-}
-YES_SET = {"yes", "y", "true", "available"}
-MOST_PEOPLE_RATIO = 0.80
+availability_file = st.file_uploader("Upload Availability Form", type=["xlsx"])
+positions_file = st.file_uploader("Upload Serving Positions File", type=["xlsx"])
 
-# Upload files
-people_file = st.file_uploader("Upload Serving Positions (.xlsx)", type="xlsx")
-responses_file = st.file_uploader("Upload Form Responses (.xlsx)", type="xlsx")
-submit_btn = st.button("Generate Schedule")
+if availability_file and positions_file:
+    availability_df = pd.read_excel(availability_file)
+    positions_df = pd.read_excel(positions_file)
 
-# Helpers
-def normalize(s): return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
-def detect_name_col(df): return next((c for c in df.columns if "name" in c.lower()), df.columns[0])
-def is_priority_col(series): return pd.to_numeric(series, errors="coerce").between(0, 5).all()
+    # Parse dates from header
+    service_dates = [col for col in availability_df.columns if "September" in col]
 
-def parse_dates(responses_df):
-    date_cols = [c for c in responses_df.columns if "available" in c.lower()]
-    result = {}
-    for col in date_cols:
-        m = re.search(r"(\d{1,2})\s*([a-zA-Z]+)", col)
-        if m:
-            day, mon = int(m.group(1)), MONTH_ALIASES[m.group(2).lower()[:3]]
-            year = pd.to_datetime(responses_df["Timestamp"]).dt.year.mode()[0]
-            result[col] = pd.Timestamp(year=year, month=mon, day=day)
-    return result
+    # Standardize names
+    availability_df["Name"] = availability_df.iloc[:, 1].str.strip()
+    availability = {
+        row["Name"]: {
+            date: str(row[date]).strip().lower() == "yes" for date in service_dates
+        } for _, row in availability_df.iterrows()
+    }
 
-def parse_availability(df, name_col, date_map):
-    availability = defaultdict(dict)
-    for _, row in df.iterrows():
-        name = str(row[name_col]).strip()
-        for col, dt in date_map.items():
-            availability[name][dt] = str(row[col]).strip().lower() in YES_SET
-    return availability
+    # Transform positions into long format
+    positions_df = positions_df.rename(columns={positions_df.columns[0]: "Name"})
+    long_df = positions_df.melt(id_vars=["Name"], var_name="Role", value_name="Skill")
+    long_df.dropna(inplace=True)
+    long_df["Skill"] = pd.to_numeric(long_df["Skill"], errors="coerce").fillna(0).astype(int)
+    long_df["Name"] = long_df["Name"].str.strip()
 
-def build_long_df(people_df, name_col):
-    long_rows = []
-    for _, row in people_df.iterrows():
-        person = str(row[name_col]).strip()
-        for col in people_df.columns:
-            if col == name_col: continue
-            if is_priority_col(people_df[col]):
-                level = int(pd.to_numeric(row[col], errors="coerce") or 0)
-                if level > 0:
-                    long_rows.append({"person": person, "role": col, "priority": level})
-    return pd.DataFrame(long_rows)
+    # Keep only people present in BOTH sources
+    common_people = set(long_df["Name"]).intersection(set(availability.keys()))
+    long_df = long_df[long_df["Name"].isin(common_people)]
+    availability = {k: v for k, v in availability.items() if k in common_people}
 
-def get_people_with_few_dates(availability, min_dates=2):
-    return [name for name, dates in availability.items()
-            if sum(dates.values()) < min_dates]
-
-def make_assignment(long_df, availability, service_dates):
-    rng = np.random.default_rng(42)
-    people = long_df["person"].unique()
-    roles = long_df["role"].unique()
-    role_capacity = defaultdict(lambda: 1)
-    for role in roles:
-        if "classroom" in role: role_capacity[role] = 5
-        elif "leader" in role: role_capacity[role] = 1
-        else: role_capacity[role] = 1
-
-    count = defaultdict(int)
-    assignments = {(role, date): [] for role in roles for date in service_dates}
+    # Build eligibility map
     eligibility = defaultdict(dict)
     for _, row in long_df.iterrows():
-        eligibility[row["person"]][row["role"]] = row["priority"]
+        if row["Skill"] > 0:
+            eligibility[row["Name"]][row["Role"]] = row["Skill"]
 
-    def get_candidates(role, date, max_count):
-        return [(p, eligibility[p][role])
-                for p in people
-                if count[p] < max_count and
-                availability[p].get(date, False) and
-                role in eligibility[p]]
+    people = list(eligibility.keys())
 
-    for pass_level in [2, 3]:
+    # Build list of unique roles
+    roles = long_df["Role"].unique()
+    role_capacity = {role: 1 for role in roles}  # Default 1 per role
+
+    # Override known group roles with capacity 2
+    for r in roles:
+        if any(x in r.lower() for x in ["classroom", "bags", "nappies", "volunteers"]):
+            role_capacity[r] = 2
+
+    def get_candidates(role, date, people, eligibility, availability, count, max_count, assigned_today):
+        out = []
+        for p in people:
+            if count.get(p, 0) >= max_count:
+                continue
+            if p in assigned_today:
+                continue
+            if not availability.get(p, {}).get(date, False):
+                continue
+            pr_map = eligibility.get(p, {})
+            if role not in pr_map:
+                continue
+            out.append((p, pr_map[role]))
+        return out
+
+    def make_assignment():
+        assignments = defaultdict(lambda: defaultdict(str))
+        count = defaultdict(int)
+
+        for pass_level in [2, 3]:  # First pass = max 2 per person, second = allow 3
+            for date in service_dates:
+                assigned_today = set()
+                for role in roles:
+                    remaining = role_capacity[role] - sum(1 for x in assignments[date].values() if x == role)
+                    while remaining > 0:
+                        candidates = get_candidates(role, date, people, eligibility, availability, count, pass_level, assigned_today)
+                        if not candidates:
+                            break
+                        candidates.sort(key=lambda x: (x[1], count[x[0]]))
+                        selected = candidates[0][0]
+                        key = f"{role} ({role_capacity[role]})"
+                        # Place in first available spot
+                        for i in range(role_capacity[role]):
+                            slot = f"{key}-{i+1}"
+                            if slot not in assignments[date]:
+                                assignments[date][slot] = selected
+                                break
+                        count[selected] += 1
+                        assigned_today.add(selected)
+                        remaining -= 1
+
+        return assignments, count
+
+    def format_schedule(assignments, service_dates):
+        all_roles = sorted(set(k for date in assignments for k in assignments[date]))
+        df = pd.DataFrame(index=all_roles, columns=service_dates)
         for date in service_dates:
-            assigned_today = set()
-            for role in roles:
-                remaining = role_capacity[role] - len(assignments[(role, date)])
-                while remaining > 0:
-                    candidates = get_candidates(role, date, pass_level)
-                    if not candidates: break
-                    candidates.sort(key=lambda x: (x[1], count[x[0]]))
-                    selected = candidates[0][0]
-                    assignments[(role, date)].append(selected)
-                    count[selected] += 1
-                    assigned_today.add(selected)
-                    remaining -= 1
+            for role in all_roles:
+                df.at[role, date] = assignments[date].get(role, "")
+        return df.reset_index().rename(columns={"index": "Role"})
 
-    return assignments, count
-
-def format_schedule(assignments, service_dates, role_order=None):
-    roles = sorted({r for (r, _) in assignments}) if role_order is None else role_order
-    df = pd.DataFrame(index=roles, columns=service_dates)
-    for (role, date), names in assignments.items():
-        df.loc[role, date] = ", ".join(names)
-    df = df.fillna("")
-    df.columns = [d.strftime("%d %b") for d in df.columns]
-    return df
-
-if submit_btn and people_file and responses_file:
-    people_df = pd.read_excel(people_file)
-    responses_df = pd.read_excel(responses_file)
-
-    name_col = detect_name_col(people_df)
-    response_name_col = detect_name_col(responses_df)
-    date_map = parse_dates(responses_df)
-    service_dates = sorted(date_map.values())
-
-    long_df = build_long_df(people_df, name_col)
-    availability = parse_availability(responses_df, response_name_col, date_map)
-
-    excluded_names = get_people_with_few_dates(availability, min_dates=2)
-    availability = {k: v for k, v in availability.items() if k not in excluded_names}
-
-    assignments, count = make_assignment(long_df, availability, service_dates)
+    assignments, count = make_assignment()
     schedule_df = format_schedule(assignments, service_dates)
 
     st.success("✅ Schedule generated!")
     st.dataframe(schedule_df, use_container_width=True)
 
-    # Excel export
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        schedule_df.to_excel(writer, sheet_name="August 2025")
-        pd.DataFrame({"Name": excluded_names}).to_excel(writer, sheet_name="Unavailable (<2 dates)", index=False)
-        count_df = pd.DataFrame(list(count.items()), columns=["Name", "Assignments"])
-        count_df.to_excel(writer, sheet_name="Assignments", index=False)
-        worksheet = writer.sheets["August 2025"]
-        for i, width in enumerate([30]*len(schedule_df.columns)):
-            worksheet.set_column(i+1, i+1, width)
+    @st.cache_data
+    def convert_df(df):
+        return df.to_csv(index=False).encode('utf-8')
 
-    st.download_button("Download Excel", output.getvalue(), file_name="uKids_schedule.xlsx")
+    csv = convert_df(schedule_df)
+    st.download_button("📥 Download Schedule CSV", csv, "ukids_schedule.csv", "text/csv")
