@@ -1,98 +1,113 @@
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import datetime
+from collections import defaultdict
 from io import BytesIO
 from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import Alignment
+
+st.set_page_config(layout="wide")
+st.title("🗓️ uKids Scheduler – September 2025")
 
 # --- File Upload ---
-availability_file = st.file_uploader("Upload availability CSV", type="csv")
-positions_file = st.file_uploader("Upload serving positions CSV", type="csv")
+availability_file = st.file_uploader("Upload availability CSV", type=["csv"])
+positions_file = st.file_uploader("Upload positions CSV", type=["csv"])
 
-if not availability_file or not positions_file:
-    st.stop()
+if availability_file and positions_file:
+    availability_df = pd.read_csv(availability_file)
+    positions_df = pd.read_csv(positions_file)
 
-# --- Read Data ---
-availability_df = pd.read_csv(availability_file)
-positions_df = pd.read_csv(positions_file)
+    # --- Normalize Names and Dates ---
+    name_col = "What is your name AND surname?"
+    date_cols = [col for col in availability_df.columns if "September" in col or "7 September" in col]
 
-# --- Parse availability ---
-name_col = [col for col in availability_df.columns if "name" in col.lower()][0]
-date_cols = [col for col in availability_df.columns if "september" in col.lower()]
-
-availability = {}
-for _, row in availability_df.iterrows():
-    name = row[name_col].strip()
-    availability[name] = {col: row[col].strip().lower() == "yes" for col in date_cols}
-
-# --- Parse positions ---
-roles = positions_df.columns[1:]  # first col is name
-eligibility = {}
-for _, row in positions_df.iterrows():
-    name = row[0].strip()
-    if name not in availability:
-        continue
-    eligibility[name] = {}
-    for role in roles:
-        val = row[role]
+    service_dates = []
+    for col in date_cols:
         try:
-            val = int(val)
-        except:
-            val = 0
-        eligibility[name][role] = val
+            day = int(col.split()[2])
+            date = datetime.date(2025, 9, day)
+            service_dates.append((col, date))
+        except Exception:
+            continue
 
-# --- Assignment Logic ---
-service_dates = date_cols
-assignments = {(role, date): [] for role in roles for date in service_dates}
-count = {name: 0 for name in eligibility}
-max_assignments = 2
+    # --- Build Availability Dictionary ---
+    availability = {}
+    for _, row in availability_df.iterrows():
+        name = str(row[name_col]).strip()
+        availability[name] = {}
+        for col, date in service_dates:
+            availability[name][date] = str(row[col]).strip().lower() == "yes"
 
-for date in service_dates:
-    for role in roles:
-        capacity = positions_df[role].max()
-        while len(assignments[(role, date)]) < capacity:
-            candidates = [
+    # --- Build Eligibility Dictionary ---
+    eligibility = defaultdict(dict)
+    roles = set()
+    for _, row in positions_df.iterrows():
+        person = str(row["Name"]).strip()
+        role = str(row["Role"]).strip()
+        level = int(row["Level"])
+        if level > 0:
+            eligibility[person][role] = level
+            roles.add(role)
+
+    # --- Prepare Assignments ---
+    assignments = defaultdict(list)
+    count = defaultdict(int)
+
+    for date_label, date in service_dates:
+        for role in roles:
+            needed = int(positions_df[(positions_df["Role"] == role)]["Capacity"].max())
+            possible = [
                 p for p in eligibility
-                if eligibility[p][role] > 0 and
-                   availability[p][date] and
-                   count[p] < max_assignments and
-                   p not in assignments[(role, date)]
+                if availability.get(p, {}).get(date, False)
+                and role in eligibility[p]
+                and count[p] < 2
+                and len(assignments[(date, role)]) < needed
             ]
-            if not candidates:
-                break
-            # Choose lowest count person
-            candidates.sort(key=lambda x: count[x])
-            chosen = candidates[0]
-            assignments[(role, date)].append(chosen)
-            count[chosen] += 1
 
-# --- Output Table ---
-schedule_df = pd.DataFrame(index=roles, columns=service_dates)
-for role in roles:
-    for date in service_dates:
-        schedule_df.loc[role, date] = ", ".join(assignments[(role, date)])
+            assigned = 0
+            for p in sorted(possible, key=lambda x: count[x]):
+                if assigned >= needed:
+                    break
+                assignments[(date, role)].append(p)
+                count[p] += 1
+                assigned += 1
 
-# --- Stats Table ---
-stats_df = pd.DataFrame.from_dict(count, orient='index', columns=['Times Assigned'])
-stats_df.index.name = 'Name'
+    # --- Format for Excel ---
+    excel_output = BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "September 2025"
 
-# --- Excel Export ---
-buffer = BytesIO()
-wb = Workbook()
-ws = wb.active
-ws.title = "Schedule"
+    sorted_roles = sorted(list(roles))
+    sorted_dates = sorted([date for _, date in service_dates])
 
-for r in dataframe_to_rows(schedule_df, index=True, header=True):
-    ws.append(r)
-for col in ws.columns:
-    for cell in col:
-        cell.alignment = Alignment(wrap_text=True, vertical="top")
-        cell.column_letter = cell.column_letter
-    ws.column_dimensions[cell.column_letter].width = 25
+    # Headers
+    ws.cell(row=1, column=1).value = "Role"
+    for j, date in enumerate(sorted_dates):
+        ws.cell(row=1, column=j + 2).value = date.strftime("%-d %b")
 
-ws2 = wb.create_sheet("Stats")
-for r in dataframe_to_rows(stats_df.reset_index(), index=False, header=True):
-    ws2.append(r)
+    # Data
+    for i, role in enumerate(sorted_roles):
+        ws.cell(row=i + 2, column=1).value = role
+        for j, date in enumerate(sorted_dates):
+            people = assignments.get((date, role), [])
+            ws.cell(row=i + 2, column=j + 2).value = ", ".join(people)
 
-wb.save(buffer)
-st.download_button("📥 Download Schedule Excel", data=buffer.getvalue(), file_name="uKids Schedule.xlsx")
+    # Stats sheet
+    stats_ws = wb.create_sheet("Stats")
+    stats_ws.cell(row=1, column=1).value = "Name"
+    stats_ws.cell(row=1, column=2).value = "Assignments"
+    for i, (name, cnt) in enumerate(sorted(count.items(), key=lambda x: -x[1]), start=2):
+        stats_ws.cell(row=i, column=1).value = name
+        stats_ws.cell(row=i, column=2).value = cnt
+
+    wb.save(excel_output)
+    excel_output.seek(0)
+
+    # --- Download Link ---
+    st.success("✅ Schedule generated!")
+    st.download_button(
+        label="📥 Download Schedule (Excel)",
+        data=excel_output,
+        file_name="ukids_schedule_september_2025.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
