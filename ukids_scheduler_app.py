@@ -1,14 +1,6 @@
 # ukids_scheduler_app.py
-# Robust CSV loader + slot-per-row scheduler
-# - Accepts ANY CSV filenames for positions & availability
-# - Tries multiple encodings (utf-8, utf-8-sig, cp1252, iso-8859-1)
-# - Tries sniffed separators (engine='python', sep=None), then ',', ';', '\t', '|'
-# - Each slot is its own row (leaders included)
-# - Ignores priorities except 0 (0 = not eligible)
-# - Max 2 assignments per person across the whole month
-# - People with <2 "Yes" dates are shown on a separate sheet **for reference only** (NOT excluded)
-# - Output sheet is named like "September 2025"
-# - Columns auto-fit widths in Excel
+# Streamlit uKids scheduler with Director/Leader rules, extra-pass rows,
+# robust CSV ingestion, and Excel export.
 
 import io
 import re
@@ -70,10 +62,7 @@ MONTH_ALIASES = {
 YES_SET = {"yes", "y", "true", "available"}
 
 def read_csv_robust(uploaded_file, label_for_error):
-    """
-    Read a Streamlit UploadedFile into a DataFrame, trying multiple encodings and separators.
-    Raises a clear Streamlit error if everything fails.
-    """
+    """Read a Streamlit UploadedFile into a DataFrame, trying multiple encodings and separators."""
     raw = uploaded_file.getvalue()
     encodings = ["utf-8", "utf-8-sig", "cp1252", "iso-8859-1"]
     seps = [None, ",", ";", "\t", "|"]
@@ -115,19 +104,18 @@ def detect_name_column(df: pd.DataFrame, fallback_first: bool = True) -> str:
         return df.columns[0]
     raise ValueError("Could not detect a 'name' column.")
 
+def normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
+
 def is_priority_col(series: pd.Series) -> bool:
     vals = pd.to_numeric(series, errors="coerce").dropna()
     if len(vals) == 0:
         return False
     return (vals.min() >= 0) and (vals.max() <= 5)
 
-def normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
-
 def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
     avail_cols = [c for c in responses_df.columns if isinstance(c, str) and c.strip().lower().startswith("are you available")]
     if not avail_cols:
-        # also accept headers that contain a day number and a month name
         avail_cols = [
             c for c in responses_df.columns
             if isinstance(c, str)
@@ -167,20 +155,49 @@ def parse_month_and_dates_from_headers(responses_df: pd.DataFrame):
     sheet_name = f"{pd.Timestamp(year=year, month=month, day=1):%B %Y}"
     return year, month, date_map, service_dates, sheet_name
 
-def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols):
+def build_long_df(people_df: pd.DataFrame, name_col: str, role_cols, codes_col: str = None):
+    """
+    returns:
+      - long_df with columns [person, role, priority]
+      - role_codes flags per person: has_D / has_BL / has_PL / has_EL / has_SL + raw_codes
+    """
     records = []
+    role_codes = {}
     for _, r in people_df.iterrows():
         person = str(r[name_col]).strip()
         if not person or person.lower() == "nan":
             continue
+
+        # parse codes (2nd column)
+        flags = {"has_D": False, "has_BL": False, "has_PL": False, "has_EL": False, "has_SL": False, "raw": ""}
+        if codes_col and codes_col in people_df.columns:
+            raw = str(r.get(codes_col, "") or "")
+            flags["raw"] = raw
+            toks = re.findall(r"[A-Za-z]+", raw.upper())
+            for t in toks:
+                if t == "D":
+                    flags["has_D"] = True
+                elif t == "BL":
+                    flags["has_BL"] = True
+                elif t == "PL":
+                    flags["has_PL"] = True
+                elif t == "EL":
+                    flags["has_EL"] = True
+                elif t == "SL":
+                    flags["has_SL"] = True
+        role_codes[person] = flags
+
         for role in role_cols:
             pr = pd.to_numeric(r[role], errors="coerce")
             if pd.isna(pr):
                 continue
             pr = int(round(pr))
-            if pr >= 1:  # 0 means not an option
+            if pr >= 1:
+                # If Director: only eligible for priority==1 roles
+                if flags["has_D"] and pr != 1:
+                    continue
                 records.append({"person": person, "role": role, "priority": pr})
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), role_codes
 
 def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map):
     availability = {}
@@ -202,12 +219,25 @@ def parse_availability(responses_df: pd.DataFrame, name_col_resp: str, date_map)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Slot plan (leaders included) — every slot becomes its own row
+# Plus extra rows (Group A/B) with special rules.
 # ──────────────────────────────────────────────────────────────────────────────
+EXTRA_GROUP_A_ROWS = [
+    "Info 1", "Info 2", "Info 3", "Info 4",
+    "uKids Setup 1", "uKids Setup 2", "uKids Setup 3", "uKids Setup 4",
+]
+
+EXTRA_GROUP_B_ROWS = [
+    "Outside assistant 1", "Outside assistant 2",
+    "Helping Ninja & Check in (Only uKids Leaders)",
+    "Helping Ninja 1", "Helping Ninja 2",
+    "uKids Hall 1", "uKids Hall 2", "uKids Hall 3", "uKids Hall 4",
+]
+
 def build_slot_plan():
     return {
         # Age 1
         "Age 1 leader": 1,
-        "Age 1 classroom": 5,
+        "Age 1 classroom": 5,        # #5 is gated by D leader present
         "Age 1 nappies": 1,
         "Age 1 bags girls": 1,
         "Age 1 bags boys": 1,
@@ -249,6 +279,10 @@ def build_slot_plan():
         # Special Needs
         "Special needs leader": 1,
         "Special needs classroom": 2,
+        # Group A (each capacity 1)
+        **{r: 1 for r in EXTRA_GROUP_A_ROWS},
+        # Group B (each capacity 1)
+        **{r: 1 for r in EXTRA_GROUP_B_ROWS},
     }
 
 def expand_roles_to_slots(slot_plan):
@@ -268,37 +302,93 @@ def expand_roles_to_slots(slot_plan):
                 slot_index[lab] = role
     return slot_rows, slot_index
 
+def build_priority_lookup(long_df):
+    lut = {}
+    for _, r in long_df.iterrows():
+        lut[(str(r["person"]).strip(), str(r["role"]).strip())] = int(r["priority"])
+    return lut
+
+def served_in_priority_one(assignments_by_cell, priority_lut):
+    served = set()
+    for (row_name, _d), names in assignments_by_cell.items():
+        for nm in names:
+            if priority_lut.get((nm, row_name)) == 1:
+                served.add(nm)
+    return served
+
+def is_ukids_leader(flags: dict) -> bool:
+    return bool(flags.get("has_BL") or flags.get("has_PL") or flags.get("has_EL") or flags.get("has_SL") or flags.get("has_D"))
+
+def base_max_for_person(flags: dict) -> int:
+    return 1 if flags.get("has_D", False) else 2
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core scheduling (main pass) — fill leaders & classrooms etc. within base caps
+# ──────────────────────────────────────────────────────────────────────────────
 def build_eligibility(long_df: pd.DataFrame):
+    # set of roles per person
     elig = defaultdict(set)
     for _, r in long_df.iterrows():
         elig[str(r["person"]).strip()].add(str(r["role"]).strip())
     return elig
 
-def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_person=2):
+def main_pass_schedule(long_df, availability, service_dates, role_codes):
     slot_plan = build_slot_plan()
     slot_rows, slot_to_role = expand_roles_to_slots(slot_plan)
     eligibility = build_eligibility(long_df)
 
-    # Only schedule people that exist in both sources
+    # Only schedule people in both sources
     people = sorted(set(eligibility.keys()) & set(availability.keys()))
 
-    grid = {(slot, d): "" for slot in slot_rows for d in service_dates}
+    # storage: {(row_name, date): [names]}
+    schedule_cells = {(slot, d): [] for slot in slot_rows for d in service_dates}
     assign_count = defaultdict(int)
+
+    # Helper to check if a slot is the "classroom #5" of an age with the D-gate
+    def is_gated_classroom_5(slot_name: str):
+        return slot_name in {"Age 1 classroom #5"}
+
+    def leader_for_age_on_date(age_prefix: str, d):
+        # find leader row value on date d
+        key = (f"{age_prefix} leader", d)
+        names = schedule_cells.get(key, [])
+        return names[0] if names else None
+
+    # Order slots so leaders come before classrooms (so the D-gate can work)
+    def slot_sort_key(s):
+        if "leader" in s:
+            return (0, s)
+        if "classroom" in s:
+            return (1, s)
+        return (2, s)
+    slot_rows_sorted = sorted(slot_rows, key=slot_sort_key)
 
     for d in service_dates:
         assigned_today = set()
-        for slot_row in slot_rows:
+        for slot_row in slot_rows_sorted:
             base_role = slot_to_role[slot_row]
 
+            # D-gate for "Age 1 classroom #5"
+            if is_gated_classroom_5(slot_row):
+                # need a Director as the leader for Age 1 that date
+                leader = leader_for_age_on_date("Age 1", d)
+                if not leader or not role_codes.get(leader, {}).get("has_D", False):
+                    continue  # skip filling this slot
+
+            # build candidate list
             cands = []
             for p in people:
-                if assign_count[p] >= max_assignments_per_person:
+                flags = role_codes.get(p, {})
+                # cap by base role (D:1, others:2)
+                if assign_count[p] >= base_max_for_person(flags):
                     continue
+                # not double-booked on same date
                 if p in assigned_today:
                     continue
+                # available?
                 if not availability.get(p, {}).get(d, False):
                     continue
-                # exact or normalized match
+                # eligible for this role? (exact or normalized match)
                 elig_roles = eligibility.get(p, set())
                 ok = False
                 if base_role in elig_roles:
@@ -313,21 +403,78 @@ def schedule_by_slots(long_df, availability, service_dates, max_assignments_per_
                     cands.append(p)
 
             if cands:
-                # Prioritize least-used volunteers first
                 cands.sort(key=lambda name: assign_count[name])
                 chosen = cands[0]
-                grid[(slot_row, d)] = chosen
+                schedule_cells[(slot_row, d)].append(chosen)
                 assign_count[chosen] += 1
                 assigned_today.add(chosen)
-            # else: leave empty if no eligible/available person
 
-    cols = [d.strftime("%Y-%m-%d") for d in service_dates]
-    schedule_df = pd.DataFrame(index=slot_rows, columns=cols)
-    for (slot_row, d), name in grid.items():
-        schedule_df.loc[slot_row, d.strftime("%Y-%m-%d")] = name
-    schedule_df = schedule_df.fillna("")
-    return schedule_df, dict(assign_count)
+    return schedule_cells, assign_count, slot_rows, slot_to_role
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Post Passes
+#   A) Allow +1 cap ONLY in Group A rows (Info / Setup)
+#   B) Fill Group B rows only with people who served in a #1 role (no cap raise)
+# ──────────────────────────────────────────────────────────────────────────────
+def assign_extra_group_a(service_dates, schedule_cells, assign_count, availability, role_codes):
+    for d in service_dates:
+        assigned_today = set(nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names)
+        for row_name in EXTRA_GROUP_A_ROWS:
+            key = (row_name, d)
+            if len(schedule_cells[key]) >= 1:
+                continue
+            # candidates: available, not assigned today, under (base+1)
+            cands = []
+            for p in availability.keys():
+                if not availability.get(p, {}).get(d, False):
+                    continue
+                if p in assigned_today:
+                    continue
+                flags = role_codes.get(p, {})
+                base = base_max_for_person(flags)
+                if assign_count.get(p, 0) >= base + 1:
+                    continue
+                cands.append(p)
+            cands.sort(key=lambda nm: assign_count.get(nm, 0))
+            if cands:
+                chosen = cands[0]
+                schedule_cells[key].append(chosen)
+                assign_count[chosen] = assign_count.get(chosen, 0) + 1
+
+def assign_extra_group_b(service_dates, schedule_cells, assign_count, availability, role_codes, served_p1_people):
+    for d in service_dates:
+        assigned_today = set(nm for (rn, dd), names in schedule_cells.items() if dd == d for nm in names)
+        for row_name in EXTRA_GROUP_B_ROWS:
+            key = (row_name, d)
+            if len(schedule_cells[key]) >= 1:
+                continue
+
+            cands = []
+            for p in availability.keys():
+                if p not in served_p1_people:
+                    continue
+                if not availability.get(p, {}).get(d, False):
+                    continue
+                if p in assigned_today:
+                    continue
+                flags = role_codes.get(p, {})
+                base = base_max_for_person(flags)
+                if assign_count.get(p, 0) >= base:
+                    continue
+                # special gate: Only uKids Leaders for the combined role
+                if "Helping Ninja & Check in" in row_name and not is_ukids_leader(flags):
+                    continue
+                cands.append(p)
+
+            cands.sort(key=lambda nm: assign_count.get(nm, 0))
+            if cands:
+                chosen = cands[0]
+                schedule_cells[key].append(chosen)
+                assign_count[chosen] = assign_count.get(chosen, 0) + 1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Export helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def excel_autofit(ws):
     for col_idx, column_cells in enumerate(
         ws.iter_cols(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column), start=1
@@ -338,19 +485,25 @@ def excel_autofit(ws):
             max_len = max(max_len, len(val))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 80)
 
+def build_schedule_df(schedule_cells, slot_rows, service_dates):
+    cols = [d.strftime("%Y-%m-%d") for d in service_dates]
+    schedule_df = pd.DataFrame(index=slot_rows, columns=cols)
+    for (slot_row, d), names in schedule_cells.items():
+        schedule_df.loc[slot_row, d.strftime("%Y-%m-%d")] = ", ".join(names)
+    return schedule_df.fillna("")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.subheader("1) Upload files (CSV — any filename)")
-
 c1, c2 = st.columns(2)
 with c1:
     positions_file = st.file_uploader("Serving positions (CSV)", type=["csv"], key="positions_csv_any")
 with c2:
     responses_file = st.file_uploader("Availability responses (CSV)", type=["csv"], key="responses_csv_any")
 
-st.caption("• Positions CSV: first column = volunteer names; other columns are role headings with values 0‑5 (0 = not eligible).")
-st.caption("• Responses CSV: includes a name column (e.g., 'What is your name AND surname?') and columns like 'Are you available 7 September?'.")
+st.caption("• Positions CSV: first col = volunteer names; second col = role codes (e.g., D/BL/PL/EL/SL), other cols = roles with values 0–5 (0 = not eligible).")
+st.caption("• Responses CSV: includes a name column and columns like 'Are you available 7 September?'.")
 
 if st.button("Generate Schedule", type="primary"):
     if not positions_file or not responses_file:
@@ -362,7 +515,7 @@ if st.button("Generate Schedule", type="primary"):
 
     # Detect name columns
     try:
-        name_col_positions = detect_name_column(positions_df, fallback_first=True)
+        name_col_positions = positions_df.columns[0]  # first column is full names
     except Exception as e:
         st.error(f"Could not detect a name column in positions CSV: {e}")
         st.stop()
@@ -373,20 +526,25 @@ if st.button("Generate Schedule", type="primary"):
         st.error(f"Could not detect a name column in responses CSV: {e}")
         st.stop()
 
+    # Codes column (second column)
+    codes_col = None
+    if positions_df.shape[1] >= 2:
+        codes_col = positions_df.columns[1]
+
     # Ensure name columns are strings
     positions_df[name_col_positions] = positions_df[name_col_positions].astype(str)
     responses_df[name_col_responses] = responses_df[name_col_responses].astype(str)
 
-    # Role columns
-    role_cols = [c for c in positions_df.columns if c != name_col_positions and is_priority_col(positions_df[c])]
+    # Role columns (from third column onward)
+    role_cols = [c for c in positions_df.columns[2:] if is_priority_col(positions_df[c])]
     if not role_cols:
-        st.error("No role columns with priorities (0..5) detected in the positions CSV.")
+        st.error("No role columns with priorities (0..5) detected in the positions CSV (from third column onwards).")
         st.stop()
 
-    # Build eligibility
-    long_df = build_long_df(positions_df, name_col_positions, role_cols)
+    # Build eligibility (+ role code flags)
+    long_df, role_codes = build_long_df(positions_df, name_col_positions, role_cols, codes_col=codes_col)
     if long_df.empty:
-        st.error("No eligible assignments found (all priorities are 0 or missing).")
+        st.error("No eligible assignments found (after applying Director=1-only rule and removing 0s).")
         st.stop()
 
     # Parse dates
@@ -399,17 +557,35 @@ if st.button("Generate Schedule", type="primary"):
     # Availability & <2-Yes list (INFO ONLY — not excluded)
     availability, service_dates, few_yes_list = parse_availability(responses_df, name_col_responses, date_map)
 
-    # Build schedule (no exclusions for one-Yes people)
-    schedule_df, assign_count = schedule_by_slots(
-        long_df, availability, service_dates, max_assignments_per_person=2
+    # MAIN PASS
+    schedule_cells, assign_count, slot_rows, slot_to_role = main_pass_schedule(
+        long_df, availability, service_dates, role_codes
     )
+
+    # Priority-1 served list (based on the exact slot row names that match role columns)
+    priority_lut = {(p, r): pr for _, (p, r, pr) in long_df[["person", "role", "priority"]].iterrows()}
+    served_p1_people = served_in_priority_one(schedule_cells, priority_lut)
+
+    # PASS A: allow +1 cap (non-D to 3, D to 2) but ONLY for Group A rows
+    assign_extra_group_a(service_dates, schedule_cells, assign_count, availability, role_codes)
+
+    # PASS B: fill Group B only if already served in a #1 role (no cap raise)
+    assign_extra_group_b(service_dates, schedule_cells, assign_count, availability, role_codes, served_p1_people)
+
+    # Build schedule DataFrame
+    schedule_df = build_schedule_df(schedule_cells, slot_rows, service_dates)
 
     # Stats
     total_slots = schedule_df.size
     filled_slots = int((schedule_df != "").sum().sum())
     fill_rate = (filled_slots / total_slots) if total_slots else 0.0
     unfilled = total_slots - filled_slots
-    per_person = pd.Series(assign_count, name="Assignments").sort_values(ascending=False).reset_index().rename(columns={"index":"Person"})
+    per_person = (
+        pd.Series(assign_count, name="Assignments")
+        .sort_values(ascending=False)
+        .reset_index()
+        .rename(columns={"index": "Person"})
+    )
 
     st.success(f"Schedule generated for **{sheet_name}**")
     st.write(f"Filled slots: **{filled_slots} / {total_slots}**  (Fill rate: **{fill_rate:.1%}**)  •  Unfilled: **{unfilled}**")
@@ -431,8 +607,8 @@ if st.button("Generate Schedule", type="primary"):
 
     header = ["Position / Slot"] + [d.strftime("%Y-%m-%d") for d in service_dates]
     ws.append(header)
-    for idx, row_name in enumerate(schedule_df.index, start=2):
-        row_vals = [row_name] + [schedule_df.iloc[idx-2, j] for j in range(len(service_dates))]
+    for row_name in slot_rows:
+        row_vals = [row_name] + [", ".join(schedule_cells[(row_name, d)]) for d in service_dates]
         ws.append(row_vals)
     excel_autofit(ws)
 
